@@ -1,4 +1,6 @@
 # stuff "git status" should ignore
+.idea/
+.vscode/
 
 # build output
 .libs
