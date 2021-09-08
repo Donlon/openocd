@@ -792,8 +792,21 @@ int flash_write_unlock_verify(struct target *target, struct image *image,
 		if (retval != ERROR_OK)
 			goto done;
 		if (c == NULL) {
-			LOG_WARNING("no flash bank found for address " TARGET_ADDR_FMT, run_address);
-			section++;	/* and skip it */
+			// LOG_WARNING("no flash bank found for address " TARGET_ADDR_FMT, run_address);
+			// TODO: if SRAM-write is enabled
+            size_t size_read;
+            buffer = malloc(run_size);
+            retval = image_read_section(image, section, section_offset,
+                                        run_size, buffer, &size_read);
+            retval = target_write_buffer(target, run_address, run_size, buffer);
+            free(buffer);
+            buffer = NULL;
+            if (retval != ERROR_OK) {
+                LOG_ERROR("Can't write %d bytes to 0x%08x, %d", run_size, run_address, retval);
+                return retval;
+            }
+            LOG_INFO("Write %d bytes to 0x%08x", run_size, run_address);
+            section++;
 			section_offset = 0;
 			continue;
 		}
