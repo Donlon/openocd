@@ -22,6 +22,7 @@
 
 #include <jtag/interface.h>
 #include <jtag/commands.h>
+#include "helper/system.h"
 #include "libusb_helper.h"
 
 #define USB_VID						0x15ba
@@ -102,7 +103,7 @@ static int armjtagew_execute_queue(void)
 	enum scan_type type;
 	uint8_t *buffer;
 
-	while (cmd != NULL) {
+	while (cmd) {
 		switch (cmd->type) {
 			case JTAG_RUNTEST:
 				LOG_DEBUG_IO("runtest %i cycles, end in %i",

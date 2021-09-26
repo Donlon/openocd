@@ -1,4 +1,7 @@
 /***************************************************************************
+ *   Copyright (C) 2021 by Adrian Negreanu                                 *
+ *   groleo@gmail.com                                                      *
+ *                                                                         *
  *   Copyright (C) 2018 by Mickaël Thomas                                  *
  *   mickael9@gmail.com                                                    *
  *                                                                         *
@@ -36,10 +39,12 @@
 #endif
 
 #include <transport/transport.h>
+#include "helper/replacements.h"
 #include <jtag/swd.h>
 #include <jtag/interface.h>
 #include <jtag/commands.h>
 #include <jtag/tcl.h>
+#include <target/cortex_m.h>
 
 #include "cmsis_dap.h"
 
@@ -95,9 +100,18 @@ static bool swd_mode;
 #define INFO_ID_CAPS              0xf0      /* byte */
 #define INFO_ID_PKT_CNT           0xfe      /* byte */
 #define INFO_ID_PKT_SZ            0xff      /* short */
+#define INFO_ID_SWO_BUF_SZ        0xfd      /* word */
 
-#define INFO_CAPS_SWD             0x01
-#define INFO_CAPS_JTAG            0x02
+#define INFO_CAPS_SWD                 BIT(0)
+#define INFO_CAPS_JTAG                BIT(1)
+#define INFO_CAPS_SWO_UART            BIT(2)
+#define INFO_CAPS_SWO_MANCHESTER      BIT(3)
+#define INFO_CAPS_ATOMIC_CMDS         BIT(4)
+#define INFO_CAPS_TEST_DOMAIN_TIMER   BIT(5)
+#define INFO_CAPS_SWO_STREAMING_TRACE BIT(6)
+#define INFO_CAPS_UART_PORT           BIT(7)
+#define INFO_CAPS_USB_COM_PORT        BIT(8)
+#define INFO_CAPS__NUM_CAPS               9
 
 /* CMD_LED */
 #define LED_ID_CONNECT            0x00
@@ -136,6 +150,7 @@ static bool swd_mode;
 
 /* CMSIS-DAP SWD Commands */
 #define CMD_DAP_SWD_CONFIGURE     0x13
+#define CMD_DAP_SWD_SEQUENCE      0x1D
 
 /* CMSIS-DAP JTAG Commands */
 #define CMD_DAP_JTAG_SEQ          0x14
@@ -161,12 +176,49 @@ static bool swd_mode;
 #define DAP_OK                    0
 #define DAP_ERROR                 0xFF
 
+/* CMSIS-DAP SWO Commands */
+#define CMD_DAP_SWO_TRANSPORT     0x17
+#define CMD_DAP_SWO_MODE          0x18
+#define CMD_DAP_SWO_BAUDRATE      0x19
+#define CMD_DAP_SWO_CONTROL       0x1A
+#define CMD_DAP_SWO_STATUS        0x1B
+#define CMD_DAP_SWO_DATA          0x1C
+#define CMD_DAP_SWO_EX_STATUS     0x1E
+
+/* SWO transport mode for reading trace data */
+#define DAP_SWO_TRANSPORT_NONE    0
+#define DAP_SWO_TRANSPORT_DATA    1
+#define DAP_SWO_TRANSPORT_WINUSB  2
+
+/* SWO trace capture mode */
+#define DAP_SWO_MODE_OFF          0
+#define DAP_SWO_MODE_UART         1
+#define DAP_SWO_MODE_MANCHESTER   2
+
+/* SWO trace data capture */
+#define DAP_SWO_CONTROL_STOP      0
+#define DAP_SWO_CONTROL_START     1
+
+/* SWO trace status */
+#define DAP_SWO_STATUS_CAPTURE_INACTIVE      0
+#define DAP_SWO_STATUS_CAPTURE_ACTIVE        1
+#define DAP_SWO_STATUS_CAPTURE_MASK          BIT(0)
+#define DAP_SWO_STATUS_STREAM_ERROR_MASK     BIT(6)
+#define DAP_SWO_STATUS_BUFFER_OVERRUN_MASK   BIT(7)
+
 /* CMSIS-DAP Vendor Commands
  * None as yet... */
 
-static const char * const info_caps_str[] = {
-	"SWD  Supported",
-	"JTAG Supported"
+static const char * const info_caps_str[INFO_CAPS__NUM_CAPS] = {
+	"SWD  supported",
+	"JTAG supported",
+	"SWO-UART supported",
+	"SWO-MANCHESTER supported",
+	"Atomic commands supported",
+	"Test domain timer supported",
+	"SWO streaming trace supported",
+	"UART communication port supported",
+	"UART via USB COM port supported",
 };
 
 struct pending_transfer_result {
@@ -221,12 +273,14 @@ static uint8_t output_pins = SWJ_PIN_SRST | SWJ_PIN_TRST;
 static struct cmsis_dap *cmsis_dap_handle;
 
 
+static int cmsis_dap_quit(void);
+
 static int cmsis_dap_open(void)
 {
 	const struct cmsis_dap_backend *backend = NULL;
 
 	struct cmsis_dap *dap = calloc(1, sizeof(struct cmsis_dap));
-	if (dap == NULL) {
+	if (!dap) {
 		LOG_ERROR("unable to allocate memory");
 		return ERROR_FAIL;
 	}
@@ -247,7 +301,7 @@ static int cmsis_dap_open(void)
 		}
 	}
 
-	if (backend == NULL) {
+	if (!backend) {
 		LOG_ERROR("unable to find a matching CMSIS-DAP device");
 		free(dap);
 		return ERROR_FAIL;
@@ -279,6 +333,21 @@ static void cmsis_dap_close(struct cmsis_dap *dap)
 	}
 }
 
+static void cmsis_dap_flush_read(struct cmsis_dap *dap)
+{
+	unsigned int i;
+	/* Some CMSIS-DAP adapters keep buffered packets over
+	 * USB close/open so we need to flush up to 64 old packets
+	 * to be sure all buffers are empty */
+	for (i = 0; i < 64; i++) {
+		int retval = dap->backend->read(dap, 10);
+		if (retval == ERROR_TIMEOUT_REACHED)
+			break;
+	}
+	if (i)
+		LOG_DEBUG("Flushed %u packets", i);
+}
+
 /* Send a message and receive the reply */
 static int cmsis_dap_xfer(struct cmsis_dap *dap, int txlen)
 {
@@ -292,6 +361,7 @@ static int cmsis_dap_xfer(struct cmsis_dap *dap, int txlen)
 		pending_fifo_get_idx = 0;
 	}
 
+	uint8_t current_cmd = cmsis_dap_handle->command[0];
 	int retval = dap->backend->write(dap, txlen, USB_TIMEOUT);
 	if (retval < 0)
 		return retval;
@@ -301,12 +371,25 @@ static int cmsis_dap_xfer(struct cmsis_dap *dap, int txlen)
 	if (retval < 0)
 		return retval;
 
+	uint8_t *resp = cmsis_dap_handle->response;
+	if (resp[0] == DAP_ERROR) {
+		LOG_ERROR("CMSIS-DAP command 0x%" PRIx8 " not implemented", current_cmd);
+		return ERROR_NOT_IMPLEMENTED;
+	}
+
+	if (resp[0] != current_cmd) {
+		LOG_ERROR("CMSIS-DAP command mismatch. Sent 0x%" PRIx8
+			 " received 0x%" PRIx8, current_cmd, resp[0]);
+
+		cmsis_dap_flush_read(dap);
+		return ERROR_FAIL;
+	}
+
 	return ERROR_OK;
 }
 
-static int cmsis_dap_cmd_DAP_SWJ_Pins(uint8_t pins, uint8_t mask, uint32_t delay, uint8_t *input)
+static int cmsis_dap_cmd_dap_swj_pins(uint8_t pins, uint8_t mask, uint32_t delay, uint8_t *input)
 {
-	int retval;
 	uint8_t *command = cmsis_dap_handle->command;
 
 	command[0] = CMD_DAP_SWJ_PINS;
@@ -314,8 +397,7 @@ static int cmsis_dap_cmd_DAP_SWJ_Pins(uint8_t pins, uint8_t mask, uint32_t delay
 	command[2] = mask;
 	h_u32_to_le(&command[3], delay);
 
-	retval = cmsis_dap_xfer(cmsis_dap_handle, 7);
-
+	int retval = cmsis_dap_xfer(cmsis_dap_handle, 7);
 	if (retval != ERROR_OK) {
 		LOG_ERROR("CMSIS-DAP command CMD_DAP_SWJ_PINS failed.");
 		return ERROR_JTAG_DEVICE_ERROR;
@@ -327,9 +409,8 @@ static int cmsis_dap_cmd_DAP_SWJ_Pins(uint8_t pins, uint8_t mask, uint32_t delay
 	return ERROR_OK;
 }
 
-static int cmsis_dap_cmd_DAP_SWJ_Clock(uint32_t swj_clock)
+static int cmsis_dap_cmd_dap_swj_clock(uint32_t swj_clock)
 {
-	int retval;
 	uint8_t *command = cmsis_dap_handle->command;
 
 	/* set clock in Hz */
@@ -338,8 +419,7 @@ static int cmsis_dap_cmd_DAP_SWJ_Clock(uint32_t swj_clock)
 	command[0] = CMD_DAP_SWJ_CLOCK;
 	h_u32_to_le(&command[1], swj_clock);
 
-	retval = cmsis_dap_xfer(cmsis_dap_handle, 5);
-
+	int retval = cmsis_dap_xfer(cmsis_dap_handle, 5);
 	if (retval != ERROR_OK || cmsis_dap_handle->response[1] != DAP_OK) {
 		LOG_ERROR("CMSIS-DAP command CMD_DAP_SWJ_CLOCK failed.");
 		return ERROR_JTAG_DEVICE_ERROR;
@@ -349,9 +429,8 @@ static int cmsis_dap_cmd_DAP_SWJ_Clock(uint32_t swj_clock)
 }
 
 /* clock a sequence of bits out on TMS, to change JTAG states */
-static int cmsis_dap_cmd_DAP_SWJ_Sequence(uint8_t s_len, const uint8_t *sequence)
+static int cmsis_dap_cmd_dap_swj_sequence(uint8_t s_len, const uint8_t *sequence)
 {
-	int retval;
 	uint8_t *command = cmsis_dap_handle->command;
 
 #ifdef CMSIS_DAP_JTAG_DEBUG
@@ -366,23 +445,21 @@ static int cmsis_dap_cmd_DAP_SWJ_Sequence(uint8_t s_len, const uint8_t *sequence
 	command[1] = s_len;
 	bit_copy(&command[2], 0, sequence, 0, s_len);
 
-	retval = cmsis_dap_xfer(cmsis_dap_handle, 2 + DIV_ROUND_UP(s_len, 8));
+	int retval = cmsis_dap_xfer(cmsis_dap_handle, 2 + DIV_ROUND_UP(s_len, 8));
 	if (retval != ERROR_OK || cmsis_dap_handle->response[1] != DAP_OK)
 		return ERROR_FAIL;
 
 	return ERROR_OK;
 }
 
-static int cmsis_dap_cmd_DAP_Info(uint8_t info, uint8_t **data)
+static int cmsis_dap_cmd_dap_info(uint8_t info, uint8_t **data)
 {
-	int retval;
 	uint8_t *command = cmsis_dap_handle->command;
 
 	command[0] = CMD_DAP_INFO;
 	command[1] = info;
 
-	retval = cmsis_dap_xfer(cmsis_dap_handle, 2);
-
+	int retval = cmsis_dap_xfer(cmsis_dap_handle, 2);
 	if (retval != ERROR_OK) {
 		LOG_ERROR("CMSIS-DAP command CMD_INFO failed.");
 		return ERROR_JTAG_DEVICE_ERROR;
@@ -393,17 +470,15 @@ static int cmsis_dap_cmd_DAP_Info(uint8_t info, uint8_t **data)
 	return ERROR_OK;
 }
 
-static int cmsis_dap_cmd_DAP_LED(uint8_t led, uint8_t state)
+static int cmsis_dap_cmd_dap_led(uint8_t led, uint8_t state)
 {
-	int retval;
 	uint8_t *command = cmsis_dap_handle->command;
 
 	command[0] = CMD_DAP_LED;
 	command[1] = led;
 	command[2] = state;
 
-	retval = cmsis_dap_xfer(cmsis_dap_handle, 3);
-
+	int retval = cmsis_dap_xfer(cmsis_dap_handle, 3);
 	if (retval != ERROR_OK || cmsis_dap_handle->response[1] != DAP_OK) {
 		LOG_ERROR("CMSIS-DAP command CMD_LED failed.");
 		return ERROR_JTAG_DEVICE_ERROR;
@@ -412,16 +487,14 @@ static int cmsis_dap_cmd_DAP_LED(uint8_t led, uint8_t state)
 	return ERROR_OK;
 }
 
-static int cmsis_dap_cmd_DAP_Connect(uint8_t mode)
+static int cmsis_dap_cmd_dap_connect(uint8_t mode)
 {
-	int retval;
 	uint8_t *command = cmsis_dap_handle->command;
 
 	command[0] = CMD_DAP_CONNECT;
 	command[1] = mode;
 
-	retval = cmsis_dap_xfer(cmsis_dap_handle, 2);
-
+	int retval = cmsis_dap_xfer(cmsis_dap_handle, 2);
 	if (retval != ERROR_OK) {
 		LOG_ERROR("CMSIS-DAP command CMD_CONNECT failed.");
 		return ERROR_JTAG_DEVICE_ERROR;
@@ -435,15 +508,13 @@ static int cmsis_dap_cmd_DAP_Connect(uint8_t mode)
 	return ERROR_OK;
 }
 
-static int cmsis_dap_cmd_DAP_Disconnect(void)
+static int cmsis_dap_cmd_dap_disconnect(void)
 {
-	int retval;
 	uint8_t *command = cmsis_dap_handle->command;
 
 	command[0] = CMD_DAP_DISCONNECT;
 
-	retval = cmsis_dap_xfer(cmsis_dap_handle, 1);
-
+	int retval = cmsis_dap_xfer(cmsis_dap_handle, 1);
 	if (retval != ERROR_OK || cmsis_dap_handle->response[1] != DAP_OK) {
 		LOG_ERROR("CMSIS-DAP command CMD_DISCONNECT failed.");
 		return ERROR_JTAG_DEVICE_ERROR;
@@ -452,9 +523,8 @@ static int cmsis_dap_cmd_DAP_Disconnect(void)
 	return ERROR_OK;
 }
 
-static int cmsis_dap_cmd_DAP_TFER_Configure(uint8_t idle, uint16_t retry_count, uint16_t match_retry)
+static int cmsis_dap_cmd_dap_tfer_configure(uint8_t idle, uint16_t retry_count, uint16_t match_retry)
 {
-	int retval;
 	uint8_t *command = cmsis_dap_handle->command;
 
 	command[0] = CMD_DAP_TFER_CONFIGURE;
@@ -462,8 +532,7 @@ static int cmsis_dap_cmd_DAP_TFER_Configure(uint8_t idle, uint16_t retry_count, 
 	h_u16_to_le(&command[2], retry_count);
 	h_u16_to_le(&command[4], match_retry);
 
-	retval = cmsis_dap_xfer(cmsis_dap_handle, 6);
-
+	int retval = cmsis_dap_xfer(cmsis_dap_handle, 6);
 	if (retval != ERROR_OK || cmsis_dap_handle->response[1] != DAP_OK) {
 		LOG_ERROR("CMSIS-DAP command CMD_TFER_Configure failed.");
 		return ERROR_JTAG_DEVICE_ERROR;
@@ -472,16 +541,14 @@ static int cmsis_dap_cmd_DAP_TFER_Configure(uint8_t idle, uint16_t retry_count, 
 	return ERROR_OK;
 }
 
-static int cmsis_dap_cmd_DAP_SWD_Configure(uint8_t cfg)
+static int cmsis_dap_cmd_dap_swd_configure(uint8_t cfg)
 {
-	int retval;
 	uint8_t *command = cmsis_dap_handle->command;
 
 	command[0] = CMD_DAP_SWD_CONFIGURE;
 	command[1] = cfg;
 
-	retval = cmsis_dap_xfer(cmsis_dap_handle, 2);
-
+	int retval = cmsis_dap_xfer(cmsis_dap_handle, 2);
 	if (retval != ERROR_OK || cmsis_dap_handle->response[1] != DAP_OK) {
 		LOG_ERROR("CMSIS-DAP command CMD_SWD_Configure failed.");
 		return ERROR_JTAG_DEVICE_ERROR;
@@ -491,16 +558,14 @@ static int cmsis_dap_cmd_DAP_SWD_Configure(uint8_t cfg)
 }
 
 #if 0
-static int cmsis_dap_cmd_DAP_Delay(uint16_t delay_us)
+static int cmsis_dap_cmd_dap_delay(uint16_t delay_us)
 {
-	int retval;
 	uint8_t *command = cmsis_dap_handle->command;
 
 	command[0] = CMD_DAP_DELAY;
 	h_u16_to_le(&command[1], delay_us);
 
-	retval = cmsis_dap_xfer(cmsis_dap_handle, 3);
-
+	int retval = cmsis_dap_xfer(cmsis_dap_handle, 3);
 	if (retval != ERROR_OK || cmsis_dap_handle->response[1] != DAP_OK) {
 		LOG_ERROR("CMSIS-DAP command CMD_Delay failed.");
 		return ERROR_JTAG_DEVICE_ERROR;
@@ -509,6 +574,203 @@ static int cmsis_dap_cmd_DAP_Delay(uint16_t delay_us)
 	return ERROR_OK;
 }
 #endif
+
+static int cmsis_dap_metacmd_targetsel(uint32_t instance_id)
+{
+	uint8_t *command = cmsis_dap_handle->command;
+	const uint32_t SEQ_RD = 0x80, SEQ_WR = 0x00;
+
+	/* SWD multi-drop requires a transfer ala CMD_DAP_TFER,
+	but with no expectation of an SWD ACK response.  In
+	CMSIS-DAP v1.20 and v2.00, CMD_DAP_SWD_SEQUENCE was
+	added to allow this special sequence to be generated.
+	The purpose of this operation is to select the target
+	corresponding to the instance_id that is written */
+
+	size_t idx = 0;
+	command[idx++] = CMD_DAP_SWD_SEQUENCE;
+	command[idx++] = 3;	/* sequence count */
+
+	/* sequence 0: packet request for TARGETSEL */
+	command[idx++] = SEQ_WR | 8;
+	command[idx++] = SWD_CMD_START | swd_cmd(false, false, DP_TARGETSEL) | SWD_CMD_STOP | SWD_CMD_PARK;
+
+	/* sequence 1: read Trn ACK Trn, no expectation for target to ACK  */
+	command[idx++] = SEQ_RD | 5;
+
+	/* sequence 2: WDATA plus parity */
+	command[idx++] = SEQ_WR | (32 + 1);
+	h_u32_to_le(command + idx, instance_id);
+	idx += 4;
+	command[idx++] = parity_u32(instance_id);
+
+	int retval = cmsis_dap_xfer(cmsis_dap_handle, idx);
+	if (retval != ERROR_OK || cmsis_dap_handle->response[1] != DAP_OK) {
+		LOG_ERROR("CMSIS-DAP command SWD_Sequence failed.");
+		return ERROR_JTAG_DEVICE_ERROR;
+	}
+
+	return ERROR_OK;
+}
+
+/**
+ * Sets the SWO transport mode.
+ * @param[in] transport     The transport mode. Can be None, SWO_Data or
+ *                          WinUSB (requires CMSIS-DAP v2).
+ */
+static int cmsis_dap_cmd_dap_swo_transport(uint8_t transport)
+{
+	uint8_t *command = cmsis_dap_handle->command;
+
+	command[0] = CMD_DAP_SWO_TRANSPORT;
+	command[1] = transport;
+
+	int retval = cmsis_dap_xfer(cmsis_dap_handle, 2);
+	if (retval != ERROR_OK || cmsis_dap_handle->response[1] != DAP_OK) {
+		LOG_ERROR("CMSIS-DAP: command CMD_SWO_Transport(%d) failed.", transport);
+		return ERROR_JTAG_DEVICE_ERROR;
+	}
+
+	return ERROR_OK;
+}
+
+/**
+ * Sets the SWO trace capture mode.
+ * @param[in] mode          Trace capture mode. Can be UART or MANCHESTER.
+ */
+static int cmsis_dap_cmd_dap_swo_mode(uint8_t mode)
+{
+	uint8_t *command = cmsis_dap_handle->command;
+
+	command[0] = CMD_DAP_SWO_MODE;
+	command[1] = mode;
+
+	int retval = cmsis_dap_xfer(cmsis_dap_handle, 2);
+	if (retval != ERROR_OK || cmsis_dap_handle->response[1] != DAP_OK) {
+		LOG_ERROR("CMSIS-DAP: command CMD_SWO_Mode(%d) failed.", mode);
+		return ERROR_JTAG_DEVICE_ERROR;
+	}
+
+	return ERROR_OK;
+}
+
+/**
+ * Sets the baudrate for capturing SWO trace data.
+ * Can be called iteratively to determine supported baudrates.
+ * @param[in]  in_baudrate  Requested baudrate.
+ * @param[out] dev_baudrate Actual baudrate or 0 (baudrate not configured).
+ *                          When requested baudrate is not achievable the
+ *                          closest configured baudrate can be returned or
+ *                          0 which indicates that baudrate was not configured.
+ */
+static int cmsis_dap_cmd_dap_swo_baudrate(
+					uint32_t in_baudrate,
+					uint32_t *dev_baudrate)
+{
+	uint8_t *command = cmsis_dap_handle->command;
+
+	command[0] = CMD_DAP_SWO_BAUDRATE;
+	h_u32_to_le(&command[1], in_baudrate);
+
+	int retval = cmsis_dap_xfer(cmsis_dap_handle, 4);
+	uint32_t rvbr = le_to_h_u32(&cmsis_dap_handle->response[1]);
+	if (retval != ERROR_OK || rvbr == 0) {
+		LOG_ERROR("CMSIS-DAP: command CMD_SWO_Baudrate(%u) -> %u failed.", in_baudrate, rvbr);
+		if (dev_baudrate)
+			*dev_baudrate = 0;
+		return ERROR_JTAG_DEVICE_ERROR;
+	}
+
+	if (dev_baudrate)
+		*dev_baudrate = rvbr;
+
+	return ERROR_OK;
+}
+
+/**
+ * Controls the SWO trace data capture.
+ * @param[in] control       Start or stop a trace. Starting capture automatically
+ *                          flushes any existing trace data in buffers which has
+ *                          not yet been read.
+ */
+static int cmsis_dap_cmd_dap_swo_control(uint8_t control)
+{
+	uint8_t *command = cmsis_dap_handle->command;
+
+	command[0] = CMD_DAP_SWO_CONTROL;
+	command[1] = control;
+
+	int retval = cmsis_dap_xfer(cmsis_dap_handle, 2);
+	if (retval != ERROR_OK || cmsis_dap_handle->response[1] != DAP_OK) {
+		LOG_ERROR("CMSIS-DAP: command CMD_SWO_Control(%d) failed.", control);
+		return ERROR_JTAG_DEVICE_ERROR;
+	}
+
+	return ERROR_OK;
+}
+
+/**
+ * Reads the SWO trace status.
+ * @param[out] trace_status The trace's status.
+ *                          Bit0: Trace Capture (1 - active, 0 - inactive).
+ *                          Bit6: Trace Stream Error.
+ *                          Bit7: Trace Buffer Overrun.
+ * @param[out] trace_count  Number of bytes in Trace Buffer (not yet read).
+ */
+static int cmsis_dap_cmd_dap_swo_status(
+					uint8_t *trace_status,
+					size_t *trace_count)
+{
+	uint8_t *command = cmsis_dap_handle->command;
+
+	command[0] = CMD_DAP_SWO_STATUS;
+
+	int retval = cmsis_dap_xfer(cmsis_dap_handle, 1);
+	if (retval != ERROR_OK) {
+		LOG_ERROR("CMSIS-DAP: command CMD_SWO_Status failed.");
+		return ERROR_JTAG_DEVICE_ERROR;
+	}
+
+	if (trace_status)
+		*trace_status = cmsis_dap_handle->response[1];
+	if (trace_count)
+		*trace_count = le_to_h_u32(&cmsis_dap_handle->response[2]);
+
+	return ERROR_OK;
+}
+
+/**
+ * Reads the captured SWO trace data from Trace Buffer.
+ * @param[in]  max_trace_count Maximum number of Trace Data bytes to read.
+ * @param[out] trace_status The trace's status.
+ * @param[out] trace_count  Number of Trace Data bytes read.
+ * @param[out] data         Trace Data bytes read.
+ */
+static int cmsis_dap_cmd_dap_swo_data(
+					size_t max_trace_count,
+					uint8_t *trace_status,
+					size_t *trace_count,
+					uint8_t *data)
+{
+	uint8_t *command = cmsis_dap_handle->command;
+
+	command[0] = CMD_DAP_SWO_DATA;
+	h_u16_to_le(&command[1], max_trace_count);
+
+	int retval = cmsis_dap_xfer(cmsis_dap_handle, 3);
+	if (retval != ERROR_OK) {
+		LOG_ERROR("CMSIS-DAP: command CMD_SWO_Data failed.");
+		return ERROR_JTAG_DEVICE_ERROR;
+	}
+
+	*trace_status = cmsis_dap_handle->response[1];
+	*trace_count = le_to_h_u16(&cmsis_dap_handle->response[2]);
+
+	if (*trace_count > 0)
+		memcpy(data, &cmsis_dap_handle->response[4], *trace_count);
+
+	return ERROR_OK;
+}
 
 static void cmsis_dap_swd_write_from_queue(struct cmsis_dap *dap)
 {
@@ -536,8 +798,8 @@ static void cmsis_dap_swd_write_from_queue(struct cmsis_dap *dap)
 		uint32_t data = transfer->data;
 
 		LOG_DEBUG_IO("%s %s reg %x %"PRIx32,
-				cmd & SWD_CMD_APnDP ? "AP" : "DP",
-				cmd & SWD_CMD_RnW ? "read" : "write",
+				cmd & SWD_CMD_APNDP ? "AP" : "DP",
+				cmd & SWD_CMD_RNW ? "read" : "write",
 			  (cmd & SWD_CMD_A32) >> 1, data);
 
 		/* When proper WAIT handling is implemented in the
@@ -547,12 +809,12 @@ static void cmsis_dap_swd_write_from_queue(struct cmsis_dap *dap)
 		 * able to automatically retry anything (because ARM
 		 * has forgotten to implement sticky error flags
 		 * clearing). See also comments regarding
-		 * cmsis_dap_cmd_DAP_TFER_Configure() and
-		 * cmsis_dap_cmd_DAP_SWD_Configure() in
+		 * cmsis_dap_cmd_dap_tfer_configure() and
+		 * cmsis_dap_cmd_dap_swd_configure() in
 		 * cmsis_dap_init().
 		 */
-		if (!(cmd & SWD_CMD_RnW) &&
-		    !(cmd & SWD_CMD_APnDP) &&
+		if (!(cmd & SWD_CMD_RNW) &&
+		    !(cmd & SWD_CMD_APNDP) &&
 		    (cmd & SWD_CMD_A32) >> 1 == DP_CTRL_STAT &&
 		    (data & CORUNDETECT)) {
 			LOG_DEBUG("refusing to enable sticky overrun detection");
@@ -560,14 +822,13 @@ static void cmsis_dap_swd_write_from_queue(struct cmsis_dap *dap)
 		}
 
 		command[idx++] = (cmd >> 1) & 0x0f;
-		if (!(cmd & SWD_CMD_RnW)) {
+		if (!(cmd & SWD_CMD_RNW)) {
 			h_u32_to_le(&command[idx], data);
 			idx += 4;
 		}
 	}
 
 	int retval = dap->backend->write(dap, idx, USB_TIMEOUT);
-
 	if (retval < 0) {
 		queued_retval = retval;
 		goto skip;
@@ -605,6 +866,13 @@ static void cmsis_dap_swd_read_process(struct cmsis_dap *dap, int timeout_ms)
 	}
 
 	uint8_t *resp = dap->response;
+	if (resp[0] != CMD_DAP_TFER) {
+		LOG_ERROR("CMSIS-DAP command mismatch. Expected 0x%x received 0x%" PRIx8,
+			CMD_DAP_TFER, resp[0]);
+		queued_retval = ERROR_FAIL;
+		goto skip;
+	}
+
 	uint8_t transfer_count = resp[1];
 	uint8_t ack = resp[2] & 0x07;
 	if (resp[2] & 0x08) {
@@ -616,6 +884,7 @@ static void cmsis_dap_swd_read_process(struct cmsis_dap *dap, int timeout_ms)
 		LOG_DEBUG("SWD ack not OK @ %d %s", transfer_count,
 			  ack == SWD_ACK_WAIT ? "WAIT" : ack == SWD_ACK_FAULT ? "FAULT" : "JUNK");
 		queued_retval = ack == SWD_ACK_WAIT ? ERROR_WAIT : ERROR_FAIL;
+		/* TODO: use results of transfers completed before the error occurred? */
 		goto skip;
 	}
 
@@ -628,7 +897,7 @@ static void cmsis_dap_swd_read_process(struct cmsis_dap *dap, int timeout_ms)
 	size_t idx = 3;
 	for (int i = 0; i < transfer_count; i++) {
 		struct pending_transfer_result *transfer = &(block->transfers[i]);
-		if (transfer->cmd & SWD_CMD_RnW) {
+		if (transfer->cmd & SWD_CMD_RNW) {
 			static uint32_t last_read;
 			uint32_t data = le_to_h_u32(&resp[idx]);
 			uint32_t tmp = data;
@@ -637,7 +906,7 @@ static void cmsis_dap_swd_read_process(struct cmsis_dap *dap, int timeout_ms)
 			LOG_DEBUG_IO("Read result: %"PRIx32, data);
 
 			/* Imitate posted AP reads */
-			if ((transfer->cmd & SWD_CMD_APnDP) ||
+			if ((transfer->cmd & SWD_CMD_APNDP) ||
 			    ((transfer->cmd & SWD_CMD_A32) >> 1 == DP_RDBUFF)) {
 				tmp = last_read;
 				last_read = data;
@@ -675,7 +944,10 @@ static int cmsis_dap_swd_run_queue(void)
 
 static void cmsis_dap_swd_queue_cmd(uint8_t cmd, uint32_t *dst, uint32_t data)
 {
-	if (pending_fifo[pending_fifo_put_idx].transfer_count == pending_queue_len) {
+	bool targetsel_cmd = swd_cmd(false, false, DP_TARGETSEL) == cmd;
+
+	if (pending_fifo[pending_fifo_put_idx].transfer_count == pending_queue_len
+			 || targetsel_cmd) {
 		if (pending_fifo_block_count)
 			cmsis_dap_swd_read_process(cmsis_dap_handle, 0);
 
@@ -689,11 +961,16 @@ static void cmsis_dap_swd_queue_cmd(uint8_t cmd, uint32_t *dst, uint32_t data)
 	if (queued_retval != ERROR_OK)
 		return;
 
+	if (targetsel_cmd) {
+		cmsis_dap_metacmd_targetsel(data);
+		return;
+	}
+
 	struct pending_request_block *block = &pending_fifo[pending_fifo_put_idx];
 	struct pending_transfer_result *transfer = &(block->transfers[block->transfer_count]);
 	transfer->data = data;
 	transfer->cmd = cmd;
-	if (cmd & SWD_CMD_RnW) {
+	if (cmd & SWD_CMD_RNW) {
 		/* Queue a read transaction */
 		transfer->buffer = dst;
 	}
@@ -702,13 +979,13 @@ static void cmsis_dap_swd_queue_cmd(uint8_t cmd, uint32_t *dst, uint32_t data)
 
 static void cmsis_dap_swd_write_reg(uint8_t cmd, uint32_t value, uint32_t ap_delay_clk)
 {
-	assert(!(cmd & SWD_CMD_RnW));
+	assert(!(cmd & SWD_CMD_RNW));
 	cmsis_dap_swd_queue_cmd(cmd, NULL, value);
 }
 
 static void cmsis_dap_swd_read_reg(uint8_t cmd, uint32_t *value, uint32_t ap_delay_clk)
 {
-	assert(cmd & SWD_CMD_RnW);
+	assert(cmd & SWD_CMD_RNW);
 	cmsis_dap_swd_queue_cmd(cmd, value, 0);
 }
 
@@ -716,7 +993,7 @@ static int cmsis_dap_get_serial_info(void)
 {
 	uint8_t *data;
 
-	int retval = cmsis_dap_cmd_DAP_Info(INFO_ID_SERNUM, &data);
+	int retval = cmsis_dap_cmd_dap_info(INFO_ID_SERNUM, &data);
 	if (retval != ERROR_OK)
 		return retval;
 
@@ -731,7 +1008,7 @@ static int cmsis_dap_get_version_info(void)
 	uint8_t *data;
 
 	/* INFO_ID_FW_VER - string */
-	int retval = cmsis_dap_cmd_DAP_Info(INFO_ID_FW_VER, &data);
+	int retval = cmsis_dap_cmd_dap_info(INFO_ID_FW_VER, &data);
 	if (retval != ERROR_OK)
 		return retval;
 
@@ -746,20 +1023,41 @@ static int cmsis_dap_get_caps_info(void)
 	uint8_t *data;
 
 	/* INFO_ID_CAPS - byte */
-	int retval = cmsis_dap_cmd_DAP_Info(INFO_ID_CAPS, &data);
+	int retval = cmsis_dap_cmd_dap_info(INFO_ID_CAPS, &data);
 	if (retval != ERROR_OK)
 		return retval;
 
-	if (data[0] == 1) {
-		uint8_t caps = data[1];
+	if (data[0] == 1 || data[0] == 2) {
+		uint16_t caps = data[1];
+		if (data[0] == 2)
+			caps |= (uint16_t)data[2] << 8;
 
 		cmsis_dap_handle->caps = caps;
 
-		if (caps & INFO_CAPS_SWD)
-			LOG_INFO("CMSIS-DAP: %s", info_caps_str[0]);
-		if (caps & INFO_CAPS_JTAG)
-			LOG_INFO("CMSIS-DAP: %s", info_caps_str[1]);
+		for (int i = 0; i < INFO_CAPS__NUM_CAPS; ++i) {
+			if (caps & BIT(i))
+				LOG_INFO("CMSIS-DAP: %s", info_caps_str[i]);
+		}
 	}
+
+	return ERROR_OK;
+}
+
+static int cmsis_dap_get_swo_buf_sz(uint32_t *swo_buf_sz)
+{
+	uint8_t *data;
+
+	/* INFO_ID_SWO_BUF_SZ - word */
+	int retval = cmsis_dap_cmd_dap_info(INFO_ID_SWO_BUF_SZ, &data);
+	if (retval != ERROR_OK)
+		return retval;
+
+	if (data[0] != 4)
+		return ERROR_FAIL;
+
+	*swo_buf_sz = le_to_h_u32(&data[1]);
+
+	LOG_INFO("CMSIS-DAP: SWO Trace Buffer Size = %u bytes", *swo_buf_sz);
 
 	return ERROR_OK;
 }
@@ -768,7 +1066,7 @@ static int cmsis_dap_get_status(void)
 {
 	uint8_t d;
 
-	int retval = cmsis_dap_cmd_DAP_SWJ_Pins(0, 0, 0, &d);
+	int retval = cmsis_dap_cmd_dap_swj_pins(0, 0, 0, &d);
 
 	if (retval == ERROR_OK) {
 		LOG_INFO("SWCLK/TCK = %d SWDIO/TMS = %d TDI = %d TDO = %d nTRST = %d nRESET = %d",
@@ -795,18 +1093,18 @@ static int cmsis_dap_swd_switch_seq(enum swd_special_seq seq)
 		 * Reconnecting would break connecting under reset. */
 
 		/* First disconnect before connecting, Atmel EDBG needs it for SAMD/R/L/C */
-		cmsis_dap_cmd_DAP_Disconnect();
+		cmsis_dap_cmd_dap_disconnect();
 
 		/* When we are reconnecting, DAP_Connect needs to be rerun, at
 		 * least on Keil ULINK-ME */
-		retval = cmsis_dap_cmd_DAP_Connect(CONNECT_SWD);
+		retval = cmsis_dap_cmd_dap_connect(CONNECT_SWD);
 		if (retval != ERROR_OK)
 			return retval;
 	}
 
 	switch (seq) {
 	case LINE_RESET:
-		LOG_DEBUG("SWD line reset");
+		LOG_DEBUG_IO("SWD line reset");
 		s = swd_seq_line_reset;
 		s_len = swd_seq_line_reset_len;
 		break;
@@ -815,35 +1113,48 @@ static int cmsis_dap_swd_switch_seq(enum swd_special_seq seq)
 		s = swd_seq_jtag_to_swd;
 		s_len = swd_seq_jtag_to_swd_len;
 		break;
+	case JTAG_TO_DORMANT:
+		LOG_DEBUG("JTAG-to-DORMANT");
+		s = swd_seq_jtag_to_dormant;
+		s_len = swd_seq_jtag_to_dormant_len;
+		break;
 	case SWD_TO_JTAG:
 		LOG_DEBUG("SWD-to-JTAG");
 		s = swd_seq_swd_to_jtag;
 		s_len = swd_seq_swd_to_jtag_len;
+		break;
+	case SWD_TO_DORMANT:
+		LOG_DEBUG("SWD-to-DORMANT");
+		s = swd_seq_swd_to_dormant;
+		s_len = swd_seq_swd_to_dormant_len;
+		break;
+	case DORMANT_TO_SWD:
+		LOG_DEBUG("DORMANT-to-SWD");
+		s = swd_seq_dormant_to_swd;
+		s_len = swd_seq_dormant_to_swd_len;
 		break;
 	default:
 		LOG_ERROR("Sequence %d not supported", seq);
 		return ERROR_FAIL;
 	}
 
-	retval = cmsis_dap_cmd_DAP_SWJ_Sequence(s_len, s);
+	retval = cmsis_dap_cmd_dap_swj_sequence(s_len, s);
 	if (retval != ERROR_OK)
 		return retval;
 
 	/* Atmel EDBG needs renew clock setting after SWJ_Sequence
 	 * otherwise default frequency is used */
-	return cmsis_dap_cmd_DAP_SWJ_Clock(jtag_get_speed_khz());
+	return cmsis_dap_cmd_dap_swj_clock(jtag_get_speed_khz());
 }
 
 static int cmsis_dap_swd_open(void)
 {
-	int retval;
-
 	if (!(cmsis_dap_handle->caps & INFO_CAPS_SWD)) {
 		LOG_ERROR("CMSIS-DAP: SWD not supported");
 		return ERROR_JTAG_DEVICE_ERROR;
 	}
 
-	retval = cmsis_dap_cmd_DAP_Connect(CONNECT_SWD);
+	int retval = cmsis_dap_cmd_dap_connect(CONNECT_SWD);
 	if (retval != ERROR_OK)
 		return retval;
 
@@ -855,12 +1166,13 @@ static int cmsis_dap_swd_open(void)
 
 static int cmsis_dap_init(void)
 {
-	int retval;
 	uint8_t *data;
 
-	retval = cmsis_dap_open();
+	int retval = cmsis_dap_open();
 	if (retval != ERROR_OK)
 		return retval;
+
+	cmsis_dap_flush_read(cmsis_dap_handle);
 
 	retval = cmsis_dap_get_caps_info();
 	if (retval != ERROR_OK)
@@ -885,7 +1197,7 @@ static int cmsis_dap_init(void)
 			return ERROR_JTAG_DEVICE_ERROR;
 		}
 
-		retval = cmsis_dap_cmd_DAP_Connect(CONNECT_JTAG);
+		retval = cmsis_dap_cmd_dap_connect(CONNECT_JTAG);
 		if (retval != ERROR_OK)
 			return retval;
 
@@ -898,9 +1210,9 @@ static int cmsis_dap_init(void)
 	pending_queue_len = 12;
 
 	/* INFO_ID_PKT_SZ - short */
-	retval = cmsis_dap_cmd_DAP_Info(INFO_ID_PKT_SZ, &data);
+	retval = cmsis_dap_cmd_dap_info(INFO_ID_PKT_SZ, &data);
 	if (retval != ERROR_OK)
-		return retval;
+		goto init_err;
 
 	if (data[0] == 2) {  /* short */
 		uint16_t pkt_sz = data[1] + (data[2] << 8);
@@ -914,16 +1226,16 @@ static int cmsis_dap_init(void)
 			free(cmsis_dap_handle->packet_buffer);
 			retval = cmsis_dap_handle->backend->packet_buffer_alloc(cmsis_dap_handle, pkt_sz);
 			if (retval != ERROR_OK)
-				return retval;
+				goto init_err;
 
 			LOG_DEBUG("CMSIS-DAP: Packet Size = %" PRIu16, pkt_sz);
 		}
 	}
 
 	/* INFO_ID_PKT_CNT - byte */
-	retval = cmsis_dap_cmd_DAP_Info(INFO_ID_PKT_CNT, &data);
+	retval = cmsis_dap_cmd_dap_info(INFO_ID_PKT_CNT, &data);
 	if (retval != ERROR_OK)
-		return retval;
+		goto init_err;
 
 	if (data[0] == 1) { /* byte */
 		int pkt_cnt = data[1];
@@ -938,58 +1250,58 @@ static int cmsis_dap_init(void)
 		pending_fifo[i].transfers = malloc(pending_queue_len * sizeof(struct pending_transfer_result));
 		if (!pending_fifo[i].transfers) {
 			LOG_ERROR("Unable to allocate memory for CMSIS-DAP queue");
-			return ERROR_FAIL;
+			retval = ERROR_FAIL;
+			goto init_err;
 		}
 	}
 
-
-	retval = cmsis_dap_get_status();
-	if (retval != ERROR_OK)
-		return ERROR_FAIL;
+	/* Intentionally not checked for error, just logs an info message
+	 * not vital for further debugging */
+	(void)cmsis_dap_get_status();
 
 	/* Now try to connect to the target
 	 * TODO: This is all SWD only @ present */
-	retval = cmsis_dap_cmd_DAP_SWJ_Clock(jtag_get_speed_khz());
+	retval = cmsis_dap_cmd_dap_swj_clock(jtag_get_speed_khz());
 	if (retval != ERROR_OK)
-		return ERROR_FAIL;
+		goto init_err;
 
 	/* Ask CMSIS-DAP to automatically retry on receiving WAIT for
 	 * up to 64 times. This must be changed to 0 if sticky
 	 * overrun detection is enabled. */
-	retval = cmsis_dap_cmd_DAP_TFER_Configure(0, 64, 0);
+	retval = cmsis_dap_cmd_dap_tfer_configure(0, 64, 0);
 	if (retval != ERROR_OK)
-		return ERROR_FAIL;
+		goto init_err;
 
 	if (swd_mode) {
 		/* Data Phase (bit 2) must be set to 1 if sticky overrun
 		 * detection is enabled */
-		retval = cmsis_dap_cmd_DAP_SWD_Configure(0);	/* 1 TRN, no Data Phase */
+		retval = cmsis_dap_cmd_dap_swd_configure(0);	/* 1 TRN, no Data Phase */
 		if (retval != ERROR_OK)
-			return ERROR_FAIL;
+			goto init_err;
 	}
 	/* Both LEDs on */
-	retval = cmsis_dap_cmd_DAP_LED(LED_ID_CONNECT, LED_ON);
-	if (retval != ERROR_OK)
-		return ERROR_FAIL;
-
-	retval = cmsis_dap_cmd_DAP_LED(LED_ID_RUN, LED_ON);
-	if (retval != ERROR_OK)
-		return ERROR_FAIL;
+	/* Intentionally not checked for error, debugging will work
+	 * without LEDs */
+	(void)cmsis_dap_cmd_dap_led(LED_ID_CONNECT, LED_ON);
+	(void)cmsis_dap_cmd_dap_led(LED_ID_RUN, LED_ON);
 
 	/* support connecting with srst asserted */
 	enum reset_types jtag_reset_config = jtag_get_reset_config();
 
 	if (jtag_reset_config & RESET_CNCT_UNDER_SRST) {
 		if (jtag_reset_config & RESET_SRST_NO_GATING) {
-			retval = cmsis_dap_cmd_DAP_SWJ_Pins(0, SWJ_PIN_SRST, 0, NULL);
+			retval = cmsis_dap_cmd_dap_swj_pins(0, SWJ_PIN_SRST, 0, NULL);
 			if (retval != ERROR_OK)
-				return ERROR_FAIL;
+				goto init_err;
 			LOG_INFO("Connecting under reset");
 		}
 	}
 	LOG_INFO("CMSIS-DAP: Interface ready");
-
 	return ERROR_OK;
+
+init_err:
+	cmsis_dap_quit();
+	return retval;
 }
 
 static int cmsis_dap_swd_init(void)
@@ -1000,10 +1312,11 @@ static int cmsis_dap_swd_init(void)
 
 static int cmsis_dap_quit(void)
 {
-	cmsis_dap_cmd_DAP_Disconnect();
+	cmsis_dap_cmd_dap_disconnect();
+
 	/* Both LEDs off */
-	cmsis_dap_cmd_DAP_LED(LED_ID_RUN, LED_OFF);
-	cmsis_dap_cmd_DAP_LED(LED_ID_CONNECT, LED_OFF);
+	cmsis_dap_cmd_dap_led(LED_ID_RUN, LED_OFF);
+	cmsis_dap_cmd_dap_led(LED_ID_CONNECT, LED_OFF);
 
 	cmsis_dap_close(cmsis_dap_handle);
 
@@ -1021,7 +1334,7 @@ static int cmsis_dap_reset(int trst, int srst)
 	if (!trst)
 		output_pins |= SWJ_PIN_TRST;
 
-	int retval = cmsis_dap_cmd_DAP_SWJ_Pins(output_pins,
+	int retval = cmsis_dap_cmd_dap_swj_pins(output_pins,
 			SWJ_PIN_TRST | SWJ_PIN_SRST, 0, NULL);
 	if (retval != ERROR_OK)
 		LOG_ERROR("CMSIS-DAP: Interface reset failed");
@@ -1031,7 +1344,7 @@ static int cmsis_dap_reset(int trst, int srst)
 static void cmsis_dap_execute_sleep(struct jtag_command *cmd)
 {
 #if 0
-	int retval = cmsis_dap_cmd_DAP_Delay(cmd->cmd.sleep->us);
+	int retval = cmsis_dap_cmd_dap_delay(cmd->cmd.sleep->us);
 	if (retval != ERROR_OK)
 #endif
 		jtag_sleep(cmd->cmd.sleep->us);
@@ -1042,10 +1355,11 @@ static int cmsis_dap_execute_tlr_reset(struct jtag_command *cmd)
 {
 	LOG_INFO("cmsis-dap JTAG TLR_RESET");
 	uint8_t seq = 0xff;
-	int ret = cmsis_dap_cmd_DAP_SWJ_Sequence(8, &seq);
-	if (ret == ERROR_OK)
+
+	int retval = cmsis_dap_cmd_dap_swj_sequence(8, &seq);
+	if (retval == ERROR_OK)
 		tap_set_state(TAP_RESET);
-	return ret;
+	return retval;
 }
 
 /* Set new end state */
@@ -1208,7 +1522,7 @@ static void cmsis_dap_add_jtag_sequence(int s_len, const uint8_t *sequence, int 
 				s_offset + offset,
 				tms,
 				tdo_buffer,
-				tdo_buffer == NULL ? 0 : (tdo_buffer_offset + offset)
+				!tdo_buffer ? 0 : (tdo_buffer_offset + offset)
 				);
 		}
 		LOG_DEBUG_IO("END JTAG SEQ SPLIT");
@@ -1225,17 +1539,17 @@ static void cmsis_dap_add_jtag_sequence(int s_len, const uint8_t *sequence, int 
 	/* control byte */
 	queued_seq_buf[queued_seq_buf_end] =
 		(tms ? DAP_JTAG_SEQ_TMS : 0) |
-		(tdo_buffer != NULL ? DAP_JTAG_SEQ_TDO : 0) |
+		(tdo_buffer ? DAP_JTAG_SEQ_TDO : 0) |
 		(s_len == 64 ? 0 : s_len);
 
-	if (sequence != NULL)
+	if (sequence)
 		bit_copy(&queued_seq_buf[queued_seq_buf_end + 1], 0, sequence, s_offset, s_len);
 	else
 		memset(&queued_seq_buf[queued_seq_buf_end + 1], 0, DIV_ROUND_UP(s_len, 8));
 
 	queued_seq_buf_end += cmd_len;
 
-	if (tdo_buffer != NULL) {
+	if (tdo_buffer) {
 		struct pending_scan_result *scan = &pending_scan_results[pending_scan_result_count++];
 		scan->first = queued_seq_tdo_ptr;
 		queued_seq_tdo_ptr += DIV_ROUND_UP(s_len, 8);
@@ -1263,11 +1577,8 @@ static void cmsis_dap_add_tms_sequence(const uint8_t *sequence, int s_len)
 /* Move to the end state by queuing a sequence to clock into TMS */
 static void cmsis_dap_state_move(void)
 {
-	uint8_t tms_scan;
-	uint8_t tms_scan_bits;
-
-	tms_scan = tap_get_tms_path(tap_get_state(), tap_get_end_state());
-	tms_scan_bits = tap_get_tms_path_len(tap_get_state(), tap_get_end_state());
+	uint8_t tms_scan = tap_get_tms_path(tap_get_state(), tap_get_end_state());
+	uint8_t tms_scan_bits = tap_get_tms_path_len(tap_get_state(), tap_get_end_state());
 
 	LOG_DEBUG_IO("state move from %s to %s: %d clocks, %02X on tms",
 		tap_state_name(tap_get_state()), tap_state_name(tap_get_end_state()),
@@ -1382,11 +1693,10 @@ static void cmsis_dap_execute_scan(struct jtag_command *cmd)
 
 static void cmsis_dap_pathmove(int num_states, tap_state_t *path)
 {
-	int i;
 	uint8_t tms0 = 0x00;
 	uint8_t tms1 = 0xff;
 
-	for (i = 0; i < num_states; i++) {
+	for (int i = 0; i < num_states; i++) {
 		if (path[i] == tap_state_transition(tap_get_state(), false))
 			cmsis_dap_add_tms_sequence(&tms0, 1);
 		else if (path[i] == tap_state_transition(tap_get_state(), true))
@@ -1414,12 +1724,10 @@ static void cmsis_dap_execute_pathmove(struct jtag_command *cmd)
 
 static void cmsis_dap_stableclocks(int num_cycles)
 {
-	int i;
-
 	uint8_t tms = tap_get_state() == TAP_RESET;
 	/* TODO: Perform optimizations? */
 	/* Execute num_cycles. */
-	for (i = 0; i < num_cycles; i++)
+	for (int i = 0; i < num_cycles; i++)
 		cmsis_dap_add_tms_sequence(&tms, 1);
 }
 
@@ -1459,7 +1767,7 @@ static void cmsis_dap_execute_stableclocks(struct jtag_command *cmd)
 static void cmsis_dap_execute_tms(struct jtag_command *cmd)
 {
 	LOG_DEBUG_IO("TMS: %d bits", cmd->cmd.tms->num_bits);
-	cmsis_dap_cmd_DAP_SWJ_Sequence(cmd->cmd.tms->num_bits, cmd->cmd.tms->bits);
+	cmsis_dap_cmd_dap_swj_sequence(cmd->cmd.tms->num_bits, cmd->cmd.tms->bits);
 }
 
 /* TODO: Is there need to call cmsis_dap_flush() for the JTAG_PATHMOVE,
@@ -1500,7 +1808,7 @@ static int cmsis_dap_execute_queue(void)
 {
 	struct jtag_command *cmd = jtag_command_queue;
 
-	while (cmd != NULL) {
+	while (cmd) {
 		cmsis_dap_execute_command(cmd);
 		cmd = cmd->next;
 	}
@@ -1517,7 +1825,7 @@ static int cmsis_dap_speed(int speed)
 		return ERROR_JTAG_NOT_IMPLEMENTED;
 	}
 
-	return cmsis_dap_cmd_DAP_SWJ_Clock(speed);
+	return cmsis_dap_cmd_dap_swj_clock(speed);
 }
 
 static int cmsis_dap_speed_div(int speed, int *khz)
@@ -1532,6 +1840,157 @@ static int cmsis_dap_khz(int khz, int *jtag_speed)
 	return ERROR_OK;
 }
 
+static bool calculate_swo_prescaler(unsigned int traceclkin_freq,
+		uint32_t trace_freq, uint16_t *prescaler)
+{
+	unsigned int presc = (traceclkin_freq + trace_freq / 2) / trace_freq;
+	if (presc == 0 || presc > TPIU_ACPR_MAX_SWOSCALER + 1)
+		return false;
+
+	/* Probe's UART speed must be within 3% of the TPIU's SWO baud rate. */
+	unsigned int max_deviation = (traceclkin_freq * 3) / 100;
+	if (presc * trace_freq < traceclkin_freq - max_deviation ||
+	    presc * trace_freq > traceclkin_freq + max_deviation)
+		return false;
+
+	*prescaler = presc;
+
+	return true;
+}
+
+/**
+ * @see adapter_driver::config_trace
+ */
+static int cmsis_dap_config_trace(
+				bool trace_enabled,
+				enum tpiu_pin_protocol pin_protocol,
+				uint32_t port_size,
+				unsigned int *swo_freq,
+				unsigned int traceclkin_hz,
+				uint16_t *swo_prescaler)
+{
+	int retval;
+
+	if (!trace_enabled) {
+		if (cmsis_dap_handle->trace_enabled) {
+			retval = cmsis_dap_cmd_dap_swo_control(DAP_SWO_CONTROL_STOP);
+			if (retval != ERROR_OK) {
+				LOG_ERROR("Failed to disable the SWO-trace.");
+				return retval;
+			}
+		}
+		cmsis_dap_handle->trace_enabled = false;
+		LOG_INFO("SWO-trace disabled.");
+		return ERROR_OK;
+	}
+
+	if (!(cmsis_dap_handle->caps & INFO_CAPS_SWO_UART) &&
+	    !(cmsis_dap_handle->caps & INFO_CAPS_SWO_MANCHESTER)) {
+		LOG_ERROR("SWO-trace is not supported by the device.");
+		return ERROR_FAIL;
+	}
+
+	uint8_t swo_mode;
+	if (pin_protocol == TPIU_PIN_PROTOCOL_ASYNC_UART &&
+	   (cmsis_dap_handle->caps & INFO_CAPS_SWO_UART)) {
+		swo_mode = DAP_SWO_MODE_UART;
+	} else if (pin_protocol == TPIU_PIN_PROTOCOL_ASYNC_MANCHESTER &&
+		  (cmsis_dap_handle->caps & INFO_CAPS_SWO_MANCHESTER)) {
+		swo_mode = DAP_SWO_MODE_MANCHESTER;
+	} else {
+		LOG_ERROR("Selected pin protocol is not supported.");
+		return ERROR_FAIL;
+	}
+
+	if (*swo_freq == 0) {
+		LOG_INFO("SWO-trace frequency autodetection not implemented.");
+		return ERROR_FAIL;
+	}
+
+	retval = cmsis_dap_cmd_dap_swo_control(DAP_SWO_CONTROL_STOP);
+	if (retval != ERROR_OK)
+		return retval;
+
+	cmsis_dap_handle->trace_enabled = false;
+
+	retval = cmsis_dap_get_swo_buf_sz(&cmsis_dap_handle->swo_buf_sz);
+	if (retval != ERROR_OK)
+		return retval;
+
+	retval = cmsis_dap_cmd_dap_swo_transport(DAP_SWO_TRANSPORT_DATA);
+	if (retval != ERROR_OK)
+		return retval;
+
+	retval = cmsis_dap_cmd_dap_swo_mode(swo_mode);
+	if (retval != ERROR_OK)
+		return retval;
+
+	retval = cmsis_dap_cmd_dap_swo_baudrate(*swo_freq, swo_freq);
+	if (retval != ERROR_OK)
+		return retval;
+
+	if (!calculate_swo_prescaler(traceclkin_hz, *swo_freq,
+			swo_prescaler)) {
+		LOG_ERROR("SWO frequency is not suitable. Please choose a "
+			"different frequency or use auto-detection.");
+		return ERROR_FAIL;
+	}
+
+	LOG_INFO("SWO frequency: %u Hz.", *swo_freq);
+	LOG_INFO("SWO prescaler: %u.", *swo_prescaler);
+
+	retval = cmsis_dap_cmd_dap_swo_control(DAP_SWO_CONTROL_START);
+	if (retval != ERROR_OK)
+		return retval;
+
+	cmsis_dap_handle->trace_enabled = true;
+
+	return ERROR_OK;
+}
+
+/**
+ * @see adapter_driver::poll_trace
+ */
+static int cmsis_dap_poll_trace(uint8_t *buf, size_t *size)
+{
+	uint8_t trace_status;
+	size_t trace_count;
+
+	if (!cmsis_dap_handle->trace_enabled) {
+		*size = 0;
+		return ERROR_OK;
+	}
+
+	int retval = cmsis_dap_cmd_dap_swo_status(&trace_status, &trace_count);
+	if (retval != ERROR_OK)
+		return retval;
+	if ((trace_status & DAP_SWO_STATUS_CAPTURE_MASK) != DAP_SWO_STATUS_CAPTURE_ACTIVE)
+		return ERROR_FAIL;
+
+	*size = trace_count < *size ? trace_count : *size;
+	size_t read_so_far = 0;
+	do {
+		size_t rb = 0;
+		uint32_t packet_size = cmsis_dap_handle->packet_size - 4 /*data-reply*/;
+		uint32_t remaining = *size - read_so_far;
+		if (remaining < packet_size)
+			packet_size = remaining;
+		retval = cmsis_dap_cmd_dap_swo_data(
+						packet_size,
+						&trace_status,
+						&rb,
+						&buf[read_so_far]);
+		if (retval != ERROR_OK)
+			return retval;
+		if ((trace_status & DAP_SWO_STATUS_CAPTURE_MASK) != DAP_SWO_STATUS_CAPTURE_ACTIVE)
+			return ERROR_FAIL;
+
+		read_so_far += rb;
+	} while (read_so_far < *size);
+
+	return ERROR_OK;
+}
+
 COMMAND_HANDLER(cmsis_dap_handle_info_command)
 {
 	if (cmsis_dap_get_version_info() == ERROR_OK)
@@ -1542,14 +2001,12 @@ COMMAND_HANDLER(cmsis_dap_handle_info_command)
 
 COMMAND_HANDLER(cmsis_dap_handle_cmd_command)
 {
-	int retval;
-	unsigned i;
 	uint8_t *command = cmsis_dap_handle->command;
 
-	for (i = 0; i < CMD_ARGC; i++)
-		command[i] = strtoul(CMD_ARGV[i], NULL, 16);
+	for (unsigned i = 0; i < CMD_ARGC; i++)
+		COMMAND_PARSE_NUMBER(u8, CMD_ARGV[i], command[i]);
 
-	retval = cmsis_dap_xfer(cmsis_dap_handle, CMD_ARGC);
+	int retval = cmsis_dap_xfer(cmsis_dap_handle, CMD_ARGC);
 
 	if (retval != ERROR_OK) {
 		LOG_ERROR("CMSIS-DAP command failed.");
@@ -1657,7 +2114,7 @@ static const struct command_registration cmsis_dap_command_handlers[] = {
 		.handler = &cmsis_dap_handle_vid_pid_command,
 		.mode = COMMAND_CONFIG,
 		.help = "the vendor ID and product ID of the CMSIS-DAP device",
-		.usage = "(vid pid)* ",
+		.usage = "(vid pid)*",
 	},
 	{
 		.name = "cmsis_dap_serial",
@@ -1711,6 +2168,8 @@ struct adapter_driver cmsis_dap_adapter_driver = {
 	.speed = cmsis_dap_speed,
 	.khz = cmsis_dap_khz,
 	.speed_div = cmsis_dap_speed_div,
+	.config_trace = cmsis_dap_config_trace,
+	.poll_trace = cmsis_dap_poll_trace,
 
 	.jtag_ops = &cmsis_dap_interface,
 	.swd_ops = &cmsis_dap_swd_driver,

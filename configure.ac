@@ -2,7 +2,7 @@ AC_PREREQ([2.69])
 AC_INIT([openocd], [0.11.0+dev],
   [OpenOCD Mailing List <openocd-devel@lists.sourceforge.net>])
 AC_CONFIG_SRCDIR([src/openocd.c])
-AC_CONFIG_AUX_DIR([.])
+AC_CONFIG_AUX_DIR([build-aux])
 
 m4_include([config_subdir.m4])dnl
 
@@ -17,11 +17,6 @@ AC_SUBST([MAKEINFO])
 AM_INIT_AUTOMAKE([-Wall -Wno-portability dist-bzip2 dist-zip subdir-objects])
 
 AC_CONFIG_HEADERS([config.h])
-AH_BOTTOM([
-#include <helper/system.h>
-#include <helper/types.h>
-#include <helper/replacements.h>
-])
 
 AC_LANG([C])
 AC_PROG_CC
@@ -49,6 +44,9 @@ AC_SEARCH_LIBS([openpty], [util])
 
 AC_CHECK_HEADERS([sys/socket.h])
 AC_CHECK_HEADERS([elf.h])
+AC_EGREP_HEADER(Elf64_Ehdr, [elf.h], [
+  AC_DEFINE([HAVE_ELF64], [1], [Define to 1 if the system has the type `Elf64_Ehdr'.])
+])
 AC_CHECK_HEADERS([dirent.h])
 AC_CHECK_HEADERS([fcntl.h])
 AC_CHECK_HEADERS([malloc.h])
@@ -149,6 +147,9 @@ m4_define([LIBJAYLINK_ADAPTERS],
 
 m4_define([PCIE_ADAPTERS],
 	[[[xlnx_pcie_xvc], [Xilinx XVC/PCIe], [XLNX_PCIE_XVC]]])
+
+m4_define([SERIAL_PORT_ADAPTERS],
+	[[[buspirate], [Bus Pirate], [BUS_PIRATE]]])
 
 m4_define([OPTIONAL_LIBRARIES],
 	[[[capstone], [Use Capstone disassembly framework], []]])
@@ -251,6 +252,7 @@ AC_ARG_ADAPTERS([
   LIBFTDI_ADAPTERS,
   LIBFTDI_USB1_ADAPTERS
   LIBGPIOD_ADAPTERS,
+  SERIAL_PORT_ADAPTERS,
   LIBJAYLINK_ADAPTERS
   ],[auto])
 
@@ -312,10 +314,6 @@ AS_CASE(["${host_cpu}"],
 AC_ARG_ENABLE([gw16012],
   AS_HELP_STRING([--enable-gw16012], [Enable building support for the Gateworks GW16012 JTAG Programmer]),
   [build_gw16012=$enableval], [build_gw16012=no])
-
-AC_ARG_ENABLE([buspirate],
-  AS_HELP_STRING([--enable-buspirate], [Enable building support for the Buspirate]),
-  [build_buspirate=$enableval], [build_buspirate=no])
 
 AC_ARG_ENABLE([sysfsgpio],
   AS_HELP_STRING([--enable-sysfsgpio], [Enable building support for programming driven via sysfs gpios.]),
@@ -401,9 +399,12 @@ AS_CASE([$host],
     ])
     parport_use_giveio=yes
 
-    AS_IF([test "x$build_buspirate" = "xyes"], [
+    AS_IF([test "x$enable_buspirate" = "xyes"], [
       AC_MSG_ERROR([buspirate currently not supported by MinGW32 hosts])
     ])
+
+    # In case enable_buspirate=auto, make sure it will not be built.
+    enable_buspirate=no
 
     AC_SUBST([HOST_CPPFLAGS], [-D__USE_MINGW_ANSI_STDIO])
   ],
@@ -531,7 +532,7 @@ AS_IF([test "x$build_gw16012" = "xyes"], [
   AC_DEFINE([BUILD_GW16012], [0], [0 if you don't want the Gateworks GW16012 driver.])
 ])
 
-AS_IF([test "x$build_buspirate" = "xyes"], [
+AS_IF([test "x$enable_buspirate" != "xno"], [
   AC_DEFINE([BUILD_BUSPIRATE], [1], [1 if you want the Buspirate JTAG driver.])
 ], [
   AC_DEFINE([BUILD_BUSPIRATE], [0], [0 if you don't want the Buspirate JTAG driver.])
@@ -569,9 +570,6 @@ AS_IF([test "x$build_xlnx_pcie_xvc" = "xyes"], [
 PKG_CHECK_MODULES([LIBUSB1], [libusb-1.0], [
 	use_libusb1=yes
 	AC_DEFINE([HAVE_LIBUSB1], [1], [Define if you have libusb-1.x])
-	PKG_CHECK_EXISTS([libusb-1.0 >= 1.0.9],
-		[AC_DEFINE([HAVE_LIBUSB_ERROR_NAME], [1], [Define if your libusb has libusb_error_name()])],
-		[AC_MSG_WARN([libusb-1.x older than 1.0.9 detected, consider updating])])
 	LIBUSB1_CFLAGS=`echo $LIBUSB1_CFLAGS | sed 's/-I/-isystem /'`
 	AC_MSG_NOTICE([libusb-1.0 header bug workaround: LIBUSB1_CFLAGS changed to "$LIBUSB1_CFLAGS"])
 	PKG_CHECK_EXISTS([libusb-1.0 >= 1.0.16],
@@ -636,6 +634,7 @@ m4_define([PROCESS_ADAPTERS], [
 			AC_MSG_ERROR([$3 is required for the ADAPTER_DESC([adapter])])
 		])
 		ADAPTER_VAR([adapter])=no
+		AC_DEFINE([BUILD_]ADAPTER_SYM([adapter]), [0], [0 if you do not want the ]ADAPTER_DESC([adapter]).)
 	])
 	AM_CONDITIONAL(ADAPTER_SYM([adapter]), [test "x$ADAPTER_VAR([adapter])" != "xno"])
   ])
@@ -695,7 +694,7 @@ AM_CONDITIONAL([USB_BLASTER_DRIVER], [test "x$enable_usb_blaster" != "xno" -o "x
 AM_CONDITIONAL([AMTJTAGACCEL], [test "x$build_amtjtagaccel" = "xyes"])
 AM_CONDITIONAL([GW16012], [test "x$build_gw16012" = "xyes"])
 AM_CONDITIONAL([REMOTE_BITBANG], [test "x$build_remote_bitbang" = "xyes"])
-AM_CONDITIONAL([BUSPIRATE], [test "x$build_buspirate" = "xyes"])
+AM_CONDITIONAL([BUSPIRATE], [test "x$enable_buspirate" != "xno"])
 AM_CONDITIONAL([SYSFSGPIO], [test "x$build_sysfsgpio" = "xyes"])
 AM_CONDITIONAL([XLNX_PCIE_XVC], [test "x$build_xlnx_pcie_xvc" = "xyes"])
 AM_CONDITIONAL([USE_LIBUSB1], [test "x$use_libusb1" = "xyes"])
@@ -755,6 +754,8 @@ AS_IF([test "x${gcc_wextra}" = "xyes"], [
   GCC_WARNINGS="${GCC_WARNINGS} -Wcast-align"
   GCC_WARNINGS="${GCC_WARNINGS} -Wredundant-decls"
   GCC_WARNINGS="${GCC_WARNINGS} -Wpointer-arith"
+  GCC_WARNINGS="${GCC_WARNINGS} -Wundef"
+  GCC_WARNINGS="${GCC_WARNINGS} -Wno-error=deprecated-declarations"
 ])
 AS_IF([test "x${gcc_werror}" = "xyes"], [
   GCC_WARNINGS="${GCC_WARNINGS} -Werror"
@@ -780,7 +781,7 @@ m4_foreach([adapter], [USB1_ADAPTERS,
 	HIDAPI_ADAPTERS, HIDAPI_USB1_ADAPTERS, LIBFTDI_ADAPTERS,
 	LIBFTDI_USB1_ADAPTERS,
 	LIBGPIOD_ADAPTERS,
-	LIBJAYLINK_ADAPTERS, PCIE_ADAPTERS,
+	LIBJAYLINK_ADAPTERS, PCIE_ADAPTERS, SERIAL_PORT_ADAPTERS,
 	OPTIONAL_LIBRARIES],
 	[s=m4_format(["%-40s"], ADAPTER_DESC([adapter]))
 	AS_CASE([$ADAPTER_VAR([adapter])],

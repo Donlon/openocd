@@ -35,11 +35,13 @@
 /* project specific includes */
 #include <helper/binarybuffer.h>
 #include <helper/bits.h>
+#include <helper/system.h>
 #include <jtag/interface.h>
 #include <jtag/hla/hla_layout.h>
 #include <jtag/hla/hla_transport.h>
 #include <jtag/hla/hla_interface.h>
 #include <jtag/swim.h>
+#include <target/arm_adi_v5.h>
 #include <target/target.h>
 #include <transport/transport.h>
 
@@ -89,6 +91,7 @@
 #define STLINK_V3E_PID          (0x374E)
 #define STLINK_V3S_PID          (0x374F)
 #define STLINK_V3_2VCP_PID      (0x3753)
+#define STLINK_V3E_NO_MSD_PID   (0x3754)
 
 /*
  * ST-Link/V1, ST-Link/V2 and ST-Link/V2.1 are full-speed USB devices and
@@ -412,17 +415,17 @@ static inline int stlink_usb_xfer_noerrcheck(void *handle, const uint8_t *buf, i
  * Map the relevant features, quirks and workaround for specific firmware
  * version of stlink
  */
-#define STLINK_F_HAS_TRACE              BIT(0)
-#define STLINK_F_HAS_SWD_SET_FREQ       BIT(1)
-#define STLINK_F_HAS_JTAG_SET_FREQ      BIT(2)
-#define STLINK_F_HAS_MEM_16BIT          BIT(3)
-#define STLINK_F_HAS_GETLASTRWSTATUS2   BIT(4)
-#define STLINK_F_HAS_DAP_REG            BIT(5)
-#define STLINK_F_QUIRK_JTAG_DP_READ     BIT(6)
-#define STLINK_F_HAS_AP_INIT            BIT(7)
-#define STLINK_F_HAS_DPBANKSEL          BIT(8)
-#define STLINK_F_HAS_RW8_512BYTES       BIT(9)
-#define STLINK_F_FIX_CLOSE_AP           BIT(10)
+#define STLINK_F_HAS_TRACE              BIT(0)  /* v2>=j13 || v3     */
+#define STLINK_F_HAS_GETLASTRWSTATUS2   BIT(1)  /* v2>=j15 || v3     */
+#define STLINK_F_HAS_SWD_SET_FREQ       BIT(2)  /* v2>=j22           */
+#define STLINK_F_HAS_JTAG_SET_FREQ      BIT(3)  /* v2>=j24           */
+#define STLINK_F_QUIRK_JTAG_DP_READ     BIT(4)  /* v2>=j24 && v2<j32 */
+#define STLINK_F_HAS_DAP_REG            BIT(5)  /* v2>=j24 || v3     */
+#define STLINK_F_HAS_MEM_16BIT          BIT(6)  /* v2>=j26 || v3     */
+#define STLINK_F_HAS_AP_INIT            BIT(7)  /* v2>=j28 || v3     */
+#define STLINK_F_FIX_CLOSE_AP           BIT(8)  /* v2>=j29 || v3     */
+#define STLINK_F_HAS_DPBANKSEL          BIT(9)  /* v2>=j32 || v3>=j2 */
+#define STLINK_F_HAS_RW8_512BYTES       BIT(10) /*            v3>=j6 */
 
 /* aliases */
 #define STLINK_F_HAS_TARGET_VOLT        STLINK_F_HAS_TRACE
@@ -474,7 +477,7 @@ static unsigned int stlink_usb_block(void *handle)
 {
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	if (h->version.flags & STLINK_F_HAS_RW8_512BYTES)
 		return STLINKV3_MAX_RW8;
@@ -496,13 +499,8 @@ static void sync_transfer_wait_for_completion(struct libusb_transfer *transfer)
 {
 	int r, *completed = transfer->user_data;
 
-	/* Assuming a single libusb context exists.  There no existing interface into this
-	 * module to pass a libusb context.
-	 */
-	struct libusb_context *ctx = NULL;
-
 	while (!*completed) {
-		r = libusb_handle_events_completed(ctx, completed);
+		r = jtag_libusb_handle_events_completed(completed);
 		if (r < 0) {
 			if (r == LIBUSB_ERROR_INTERRUPTED)
 				continue;
@@ -572,7 +570,7 @@ static int jtag_libusb_bulk_transfer_n(
 		transfers[i].transfer_size = 0;
 		transfers[i].transfer = libusb_alloc_transfer(0);
 
-		if (transfers[i].transfer == NULL) {
+		if (!transfers[i].transfer) {
 			for (size_t j = 0; j < i; ++j)
 				libusb_free_transfer(transfers[j].transfer);
 
@@ -640,7 +638,7 @@ static int stlink_usb_xfer_v1_get_status(void *handle)
 	struct stlink_usb_handle_s *h = handle;
 	int tr, ret;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	/* read status */
 	memset(h->cmdbuf, 0, STLINK_SG_SIZE);
@@ -674,7 +672,7 @@ static int stlink_usb_xfer_rw(void *handle, int cmdsize, const uint8_t *buf, int
 {
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	size_t n_transfers = 0;
 	struct jtag_xfer transfers[2];
@@ -713,7 +711,7 @@ static int stlink_usb_xfer_rw(void *handle, int cmdsize, const uint8_t *buf, int
 	struct stlink_usb_handle_s *h = handle;
 	int tr, ret;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	ret = jtag_libusb_bulk_write(h->usb_backend_priv.fd, h->tx_ep, (char *)h->cmdbuf,
 				     cmdsize, STLINK_WRITE_TIMEOUT, &tr);
@@ -746,7 +744,7 @@ static int stlink_usb_xfer_v1_get_sense(void *handle)
 	int res;
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	stlink_usb_init_buffer(handle, h->rx_ep, 16);
 
@@ -794,7 +792,7 @@ static int stlink_usb_usb_xfer_noerrcheck(void *handle, const uint8_t *buf, int 
 	int err, cmdsize = STLINK_CMD_SIZE_V2;
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	if (h->version.stlink == 1) {
 		cmdsize = STLINK_SG_SIZE;
@@ -827,7 +825,7 @@ static int stlink_tcp_send_cmd(void *handle, int send_size, int recv_size, bool 
 {
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	/* send the TCP command */
 	int sent_size = send(h->tcp_backend_priv.fd, (void *)h->tcp_backend_priv.send_buf, send_size, 0);
@@ -872,7 +870,7 @@ static int stlink_tcp_xfer_noerrcheck(void *handle, const uint8_t *buf, int size
 	int send_size = STLINK_TCP_USB_CMD_SIZE;
 	int recv_size = STLINK_TCP_SS_SIZE;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	/* prepare the TCP command */
 	h->tcp_backend_priv.send_buf[0] = STLINK_TCP_CMD_SEND_USB_CMD;
@@ -941,7 +939,7 @@ static int stlink_usb_error_check(void *handle)
 {
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	if (h->st_mode == STLINK_MODE_DEBUG_SWIM) {
 		switch (h->databuf[0]) {
@@ -1080,7 +1078,7 @@ static int stlink_usb_read_trace(void *handle, const uint8_t *buf, int size)
 {
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	assert(h->version.flags & STLINK_F_HAS_TRACE);
 
@@ -1145,7 +1143,7 @@ static int stlink_usb_version(void *handle)
 	char *p;
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	stlink_usb_init_buffer(handle, h->rx_ep, 6);
 
@@ -1359,7 +1357,7 @@ static int stlink_usb_set_swdclk(void *handle, uint16_t clk_divisor)
 {
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	if (!(h->version.flags & STLINK_F_HAS_SWD_SET_FREQ))
 		return ERROR_COMMAND_NOTFOUND;
@@ -1383,7 +1381,7 @@ static int stlink_usb_set_jtagclk(void *handle, uint16_t clk_divisor)
 {
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	if (!(h->version.flags & STLINK_F_HAS_JTAG_SET_FREQ))
 		return ERROR_COMMAND_NOTFOUND;
@@ -1409,7 +1407,7 @@ static int stlink_usb_current_mode(void *handle, uint8_t *mode)
 	int res;
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	stlink_usb_init_buffer(handle, h->rx_ep, 2);
 
@@ -1431,7 +1429,7 @@ static int stlink_usb_mode_enter(void *handle, enum stlink_mode type)
 	int rx_size = 0;
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	/* on api V2 we are able the read the latest command
 	 * status
@@ -1479,7 +1477,7 @@ static int stlink_usb_mode_leave(void *handle, enum stlink_mode type)
 	int res;
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	/* command with no reply, use a valid endpoint but zero size */
 	stlink_usb_init_buffer(handle, h->rx_ep, 0);
@@ -1532,7 +1530,7 @@ static int stlink_usb_exit_mode(void *handle)
 	uint8_t mode;
 	enum stlink_mode emode;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	res = stlink_usb_current_mode(handle, &mode);
 
@@ -1573,7 +1571,7 @@ static int stlink_usb_init_mode(void *handle, bool connect_under_reset, int init
 	enum stlink_mode emode;
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	res = stlink_usb_exit_mode(handle);
 	if (res != ERROR_OK)
@@ -1630,7 +1628,8 @@ static int stlink_usb_init_mode(void *handle, bool connect_under_reset, int init
 		}
 	}
 
-	if (h->version.jtag_api == STLINK_JTAG_API_V3) {
+	if (h->version.jtag_api == STLINK_JTAG_API_V3 &&
+			(emode == STLINK_MODE_DEBUG_JTAG || emode == STLINK_MODE_DEBUG_SWD)) {
 		struct speed_map map[STLINK_V3_MAX_FREQ_NB];
 
 		stlink_get_com_freq(h, (emode == STLINK_MODE_DEBUG_JTAG), map);
@@ -1871,7 +1870,7 @@ static int stlink_usb_idcode(void *handle, uint32_t *idcode)
 	int res, offset;
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	/* there is no swim read core id cmd */
 	if (h->st_mode == STLINK_MODE_DEBUG_SWIM) {
@@ -1909,7 +1908,7 @@ static int stlink_usb_v2_read_debug_reg(void *handle, uint32_t addr, uint32_t *v
 	struct stlink_usb_handle_s *h = handle;
 	int res;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	stlink_usb_init_buffer(handle, h->rx_ep, 8);
 
@@ -1930,7 +1929,7 @@ static int stlink_usb_write_debug_reg(void *handle, uint32_t addr, uint32_t val)
 {
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	stlink_usb_init_buffer(handle, h->rx_ep, 2);
 
@@ -1952,7 +1951,7 @@ static int stlink_usb_trace_read(void *handle, uint8_t *buf, size_t *size)
 {
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	if (h->trace.enabled && (h->version.flags & STLINK_F_HAS_TRACE)) {
 		int res;
@@ -2003,7 +2002,7 @@ static enum target_state stlink_usb_state(void *handle)
 	int res;
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	if (h->reconnect_pending) {
 		LOG_INFO("Previous state query failed, trying to reconnect");
@@ -2045,7 +2044,7 @@ static int stlink_usb_assert_srst(void *handle, int srst)
 {
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	if (h->st_mode == STLINK_MODE_DEBUG_SWIM)
 		return stlink_swim_assert_reset(handle, srst);
@@ -2068,7 +2067,7 @@ static void stlink_usb_trace_disable(void *handle)
 	int res = ERROR_OK;
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	assert(h->version.flags & STLINK_F_HAS_TRACE);
 
@@ -2090,7 +2089,7 @@ static int stlink_usb_trace_enable(void *handle)
 	int res;
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	if (h->version.flags & STLINK_F_HAS_TRACE) {
 		stlink_usb_init_buffer(handle, h->rx_ep, 10);
@@ -2122,7 +2121,7 @@ static int stlink_usb_reset(void *handle)
 	struct stlink_usb_handle_s *h = handle;
 	int retval;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	stlink_usb_init_buffer(handle, h->rx_ep, 2);
 
@@ -2151,7 +2150,7 @@ static int stlink_usb_run(void *handle)
 	int res;
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	if (h->version.jtag_api != STLINK_JTAG_API_V1) {
 		res = stlink_usb_write_debug_reg(handle, DCB_DHCSR, DBGKEY|C_DEBUGEN);
@@ -2173,7 +2172,7 @@ static int stlink_usb_halt(void *handle)
 	int res;
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	if (h->version.jtag_api != STLINK_JTAG_API_V1) {
 		res = stlink_usb_write_debug_reg(handle, DCB_DHCSR, DBGKEY|C_HALT|C_DEBUGEN);
@@ -2194,7 +2193,7 @@ static int stlink_usb_step(void *handle)
 {
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	if (h->version.jtag_api != STLINK_JTAG_API_V1) {
 		/* TODO: this emulates the v1 api, it should really use a similar auto mask isr
@@ -2218,7 +2217,7 @@ static int stlink_usb_read_regs(void *handle)
 	int res;
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	stlink_usb_init_buffer(handle, h->rx_ep, 88);
 
@@ -2243,7 +2242,7 @@ static int stlink_usb_read_reg(void *handle, unsigned int regsel, uint32_t *val)
 	int res;
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	if (STLINK_REGSEL_IS_FPU(regsel) && !(h->version.flags & STLINK_F_HAS_FPU_REG)) {
 		res = stlink_usb_write_debug_reg(h, DCB_DCRSR, regsel & 0x7f);
@@ -2283,14 +2282,14 @@ static int stlink_usb_write_reg(void *handle, unsigned int regsel, uint32_t val)
 {
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	if (STLINK_REGSEL_IS_FPU(regsel) && !(h->version.flags & STLINK_F_HAS_FPU_REG)) {
 		int res = stlink_usb_write_debug_reg(h, DCB_DCRDR, val);
 		if (res != ERROR_OK)
 			return res;
 
-		return stlink_usb_write_debug_reg(h, DCB_DCRSR, DCRSR_WnR | (regsel & 0x7f));
+		return stlink_usb_write_debug_reg(h, DCB_DCRSR, DCRSR_WNR | (regsel & 0x7f));
 		/* FIXME: poll DHCSR.S_REGRDY after write DCRSR */
 	}
 
@@ -2312,7 +2311,7 @@ static int stlink_usb_get_rw_status(void *handle)
 {
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	if (h->version.jtag_api == STLINK_JTAG_API_V1)
 		return ERROR_OK;
@@ -2337,7 +2336,7 @@ static int stlink_usb_read_mem8(void *handle, uint32_t addr, uint16_t len,
 	uint16_t read_len = len;
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	/* max 8 bit read/write is 64 bytes or 512 bytes for v3 */
 	if (len > stlink_usb_block(h)) {
@@ -2375,7 +2374,7 @@ static int stlink_usb_write_mem8(void *handle, uint32_t addr, uint16_t len,
 	int res;
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	/* max 8 bit read/write is 64 bytes or 512 bytes for v3 */
 	if (len > stlink_usb_block(h)) {
@@ -2407,7 +2406,7 @@ static int stlink_usb_read_mem16(void *handle, uint32_t addr, uint16_t len,
 	int res;
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	if (!(h->version.flags & STLINK_F_HAS_MEM_16BIT))
 		return ERROR_COMMAND_NOTFOUND;
@@ -2444,7 +2443,7 @@ static int stlink_usb_write_mem16(void *handle, uint32_t addr, uint16_t len,
 	int res;
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	if (!(h->version.flags & STLINK_F_HAS_MEM_16BIT))
 		return ERROR_COMMAND_NOTFOUND;
@@ -2479,7 +2478,7 @@ static int stlink_usb_read_mem32(void *handle, uint32_t addr, uint16_t len,
 	int res;
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	/* data must be a multiple of 4 and word aligned */
 	if (len % 4 || addr % 4) {
@@ -2513,7 +2512,7 @@ static int stlink_usb_write_mem32(void *handle, uint32_t addr, uint16_t len,
 	int res;
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	/* data must be a multiple of 4 and word aligned */
 	if (len % 4 || addr % 4) {
@@ -2989,7 +2988,7 @@ static int stlink_tcp_close(void *handle)
 /** */
 static int stlink_close(void *handle)
 {
-	if (handle != NULL) {
+	if (handle) {
 		struct stlink_usb_handle_s *h = handle;
 
 		stlink_usb_close(handle);
@@ -3016,7 +3015,7 @@ static int stlink_close(void *handle)
  *    based on the length (0x1a = 26) we could easily decide if we have to fixup the serial
  *    and then we have just to convert the raw data into printable characters using sprintf
  */
-static char *stlink_usb_get_alternate_serial(libusb_device_handle *device,
+static char *stlink_usb_get_alternate_serial(struct libusb_device_handle *device,
 		struct libusb_device_descriptor *dev_desc)
 {
 	int usb_retval;
@@ -3068,7 +3067,7 @@ static char *stlink_usb_get_alternate_serial(libusb_device_handle *device,
 	/* else (len == 26) => buggy ST-Link */
 
 	char *alternate_serial = malloc((STLINK_SERIAL_LEN + 1) * sizeof(char));
-	if (alternate_serial == NULL)
+	if (!alternate_serial)
 		return NULL;
 
 	for (unsigned int i = 0; i < STLINK_SERIAL_LEN; i += 2)
@@ -3088,7 +3087,7 @@ static int stlink_usb_usb_open(void *handle, struct hl_interface_param_s *param)
 	h->cmdbuf = malloc(STLINK_SG_SIZE);
 	h->databuf = malloc(STLINK_DATA_SIZE);
 
-	if (h->cmdbuf == NULL || h->databuf == NULL)
+	if (!h->cmdbuf || !h->databuf)
 		return ERROR_FAIL;
 
 	/*
@@ -3133,6 +3132,7 @@ static int stlink_usb_usb_open(void *handle, struct hl_interface_param_s *param)
 			case STLINK_V3E_PID:
 			case STLINK_V3S_PID:
 			case STLINK_V3_2VCP_PID:
+			case STLINK_V3E_NO_MSD_PID:
 				h->version.stlink = 3;
 				h->tx_ep = STLINK_V2_1_TX_EP;
 				h->trace_ep = STLINK_V2_1_TRACE_EP;
@@ -3202,7 +3202,7 @@ static int stlink_tcp_open(void *handle, struct hl_interface_param_s *param)
 	h->tcp_backend_priv.send_buf = malloc(STLINK_TCP_SEND_BUFFER_SIZE);
 	h->tcp_backend_priv.recv_buf = malloc(STLINK_TCP_RECV_BUFFER_SIZE);
 
-	if (h->tcp_backend_priv.send_buf == NULL || h->tcp_backend_priv.recv_buf == NULL)
+	if (!h->tcp_backend_priv.send_buf || !h->tcp_backend_priv.recv_buf)
 		return ERROR_FAIL;
 
 	h->cmdbuf = &h->tcp_backend_priv.send_buf[8];
@@ -3311,7 +3311,7 @@ static int stlink_tcp_open(void *handle, struct hl_interface_param_s *param)
 	char serial[STLINK_TCP_SERIAL_SIZE + 1] = {0};
 	uint8_t stlink_used;
 	bool stlink_id_matched = false;
-	bool stlink_serial_matched = (param->serial == NULL);
+	bool stlink_serial_matched = (!param->serial);
 
 	for (uint32_t stlink_id = 0; stlink_id < connected_stlinks; stlink_id++) {
 		/* get the stlink info */
@@ -3538,8 +3538,8 @@ static int stlink_config_trace(void *handle, bool enabled,
 		return ERROR_OK;
 	}
 
-	assert(trace_freq != NULL);
-	assert(prescaler != NULL);
+	assert(trace_freq);
+	assert(prescaler);
 
 	if (pin_protocol != TPIU_PIN_PROTOCOL_ASYNC_UART) {
 		LOG_ERROR("The attached ST-LINK version doesn't support this trace mode");
@@ -3589,7 +3589,7 @@ static int stlink_usb_init_access_port(void *handle, unsigned char ap_num)
 {
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	if (!(h->version.flags & STLINK_F_HAS_AP_INIT))
 		return ERROR_COMMAND_NOTFOUND;
@@ -3608,7 +3608,7 @@ static int stlink_usb_close_access_port(void *handle, unsigned char ap_num)
 {
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	if (!(h->version.flags & STLINK_F_HAS_AP_INIT))
 		return ERROR_COMMAND_NOTFOUND;
@@ -3634,7 +3634,7 @@ static int stlink_read_dap_register(void *handle, unsigned short dap_port,
 	struct stlink_usb_handle_s *h = handle;
 	int retval;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	if (!(h->version.flags & STLINK_F_HAS_DAP_REG))
 		return ERROR_COMMAND_NOTFOUND;
@@ -3657,7 +3657,7 @@ static int stlink_write_dap_register(void *handle, unsigned short dap_port,
 {
 	struct stlink_usb_handle_s *h = handle;
 
-	assert(handle != NULL);
+	assert(handle);
 
 	if (!(h->version.flags & STLINK_F_HAS_DAP_REG))
 		return ERROR_COMMAND_NOTFOUND;
@@ -3903,7 +3903,7 @@ static int stlink_dap_op_queue_dp_read(struct adiv5_dap *dap, unsigned reg,
 	if (retval != ERROR_OK)
 		return retval;
 
-	data = data ? : &dummy;
+	data = data ? data : &dummy;
 	if (stlink_dap_handle->version.flags & STLINK_F_QUIRK_JTAG_DP_READ
 		&& stlink_dap_handle->st_mode == STLINK_MODE_DEBUG_JTAG) {
 		/* Quirk required in JTAG. Read RDBUFF to get the data */
@@ -3968,7 +3968,7 @@ static int stlink_dap_op_queue_ap_read(struct adiv5_ap *ap, unsigned reg,
 		if (retval != ERROR_OK)
 			return retval;
 	}
-	data = data ? : &dummy;
+	data = data ? data : &dummy;
 	retval = stlink_read_dap_register(stlink_dap_handle, ap->ap_num, reg,
 				 data);
 	dap->stlink_flush_ap_write = false;

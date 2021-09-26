@@ -298,7 +298,7 @@ struct reg_cache *etm_build_reg_cache(struct target *target,
 	reg_list = calloc(128, sizeof(struct reg));
 	arch_info = calloc(128, sizeof(struct etm_reg));
 
-	if (reg_cache == NULL || reg_list == NULL || arch_info == NULL) {
+	if (!reg_cache || !reg_list || !arch_info) {
 		LOG_ERROR("No memory");
 		goto fail;
 	}
@@ -1418,7 +1418,7 @@ COMMAND_HANDLER(handle_etm_config_command)
 		if (strcmp(CMD_ARGV[4], etm_capture_drivers[i]->name) == 0) {
 			int retval = register_commands(CMD_CTX, NULL,
 					etm_capture_drivers[i]->commands);
-			if (ERROR_OK != retval) {
+			if (retval != ERROR_OK) {
 				free(etm_ctx);
 				return retval;
 			}
@@ -1808,7 +1808,7 @@ COMMAND_HANDLER(handle_etm_load_command)
 		fileio_read_u32(file, &etm_ctx->trace_depth);
 	}
 	etm_ctx->trace_data = malloc(sizeof(struct etmv1_trace_data) * etm_ctx->trace_depth);
-	if (etm_ctx->trace_data == NULL) {
+	if (!etm_ctx->trace_data) {
 		command_print(CMD, "not enough memory to perform operation");
 		fileio_close(file);
 		return ERROR_FAIL;
@@ -2107,6 +2107,5 @@ static const struct command_registration etm_exec_command_handlers[] = {
 
 static int etm_register_user_commands(struct command_context *cmd_ctx)
 {
-	struct command *etm_cmd = command_find_in_context(cmd_ctx, "etm");
-	return register_commands(cmd_ctx, etm_cmd, etm_exec_command_handlers);
+	return register_commands(cmd_ctx, "etm", etm_exec_command_handlers);
 }

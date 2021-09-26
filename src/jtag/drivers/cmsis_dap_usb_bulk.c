@@ -35,14 +35,16 @@
 #include "config.h"
 #endif
 
+#include <helper/system.h>
 #include <libusb.h>
 #include <helper/log.h>
+#include <helper/replacements.h>
 
 #include "cmsis_dap.h"
 
 struct cmsis_dap_backend_data {
-	libusb_context *usb_ctx;
-	libusb_device_handle *dev_handle;
+	struct libusb_context *usb_ctx;
+	struct libusb_device_handle *dev_handle;
 	unsigned int ep_out;
 	unsigned int ep_in;
 	int interface;
@@ -56,8 +58,8 @@ static int cmsis_dap_usb_alloc(struct cmsis_dap *dap, unsigned int pkt_sz);
 static int cmsis_dap_usb_open(struct cmsis_dap *dap, uint16_t vids[], uint16_t pids[], char *serial)
 {
 	int err;
-	libusb_context *ctx;
-	libusb_device **device_list;
+	struct libusb_context *ctx;
+	struct libusb_device **device_list;
 
 	err = libusb_init(&ctx);
 	if (err) {
@@ -73,7 +75,7 @@ static int cmsis_dap_usb_open(struct cmsis_dap *dap, uint16_t vids[], uint16_t p
 	}
 
 	for (int i = 0; i < num_devices; i++) {
-		libusb_device *dev = device_list[i];
+		struct libusb_device *dev = device_list[i];
 		struct libusb_device_descriptor dev_desc;
 
 		err = libusb_get_device_descriptor(dev, &dev_desc);
@@ -101,7 +103,7 @@ static int cmsis_dap_usb_open(struct cmsis_dap *dap, uint16_t vids[], uint16_t p
 		if (dev_desc.iSerialNumber == 0 && serial && serial[0])
 			continue;
 
-		libusb_device_handle *dev_handle = NULL;
+		struct libusb_device_handle *dev_handle = NULL;
 		err = libusb_open(dev, &dev_handle);
 		if (err) {
 			/* It's to be expected that most USB devices can't be opened
@@ -260,7 +262,7 @@ static int cmsis_dap_usb_open(struct cmsis_dap *dap, uint16_t vids[], uint16_t p
 				 * - config asked explicitly for an interface number
 				 * - the device has only one interface
 				 * The later two cases should be honored only if we know
-				 * we are on the rigt device */
+				 * we are on the right device */
 				bool intf_identified_reliably = cmsis_dap_in_interface_str
 							|| (device_identified_reliably &&
 									(cmsis_dap_usb_interface != -1
@@ -351,7 +353,7 @@ static int cmsis_dap_usb_open(struct cmsis_dap *dap, uint16_t vids[], uint16_t p
 				LOG_WARNING("could not claim interface: %s", libusb_strerror(err));
 
 			dap->bdata = malloc(sizeof(struct cmsis_dap_backend_data));
-			if (dap->bdata == NULL) {
+			if (!dap->bdata) {
 				LOG_ERROR("unable to allocate memory");
 				libusb_release_interface(dev_handle, interface_num);
 				libusb_close(dev_handle);
@@ -368,7 +370,7 @@ static int cmsis_dap_usb_open(struct cmsis_dap *dap, uint16_t vids[], uint16_t p
 			dap->bdata->interface = interface_num;
 
 			dap->packet_buffer = malloc(dap->packet_buffer_size);
-			if (dap->packet_buffer == NULL) {
+			if (!dap->packet_buffer) {
 				LOG_ERROR("unable to allocate memory");
 				cmsis_dap_usb_close(dap);
 				return ERROR_FAIL;
@@ -444,7 +446,7 @@ static int cmsis_dap_usb_write(struct cmsis_dap *dap, int txlen, int timeout_ms)
 static int cmsis_dap_usb_alloc(struct cmsis_dap *dap, unsigned int pkt_sz)
 {
 	uint8_t *buf = malloc(pkt_sz);
-	if (buf == NULL) {
+	if (!buf) {
 		LOG_ERROR("unable to allocate CMSIS-DAP packet buffer");
 		return ERROR_FAIL;
 	}
@@ -462,7 +464,7 @@ static int cmsis_dap_usb_alloc(struct cmsis_dap *dap, unsigned int pkt_sz)
 COMMAND_HANDLER(cmsis_dap_handle_usb_interface_command)
 {
 	if (CMD_ARGC == 1)
-		cmsis_dap_usb_interface = strtoul(CMD_ARGV[0], NULL, 10);
+		COMMAND_PARSE_NUMBER(int, CMD_ARGV[0], cmsis_dap_usb_interface);
 	else
 		LOG_ERROR("expected exactly one argument to cmsis_dap_usb_interface <interface_number>");
 
