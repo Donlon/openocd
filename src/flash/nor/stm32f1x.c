@@ -592,10 +592,7 @@ static int stm32x_write(struct flash_bank *bank, const uint8_t *buffer,
 		LOG_WARNING("couldn't use block writes, falling back to single memory accesses");
 
 		while (words_remaining > 0) {
-			uint16_t value;
-			memcpy(&value, buffer, sizeof(uint16_t));
-
-			retval = target_write_u16(target, bank->base + offset, value);
+			retval = target_write_memory(target, bank->base + offset, 2, 1, buffer);
 			if (retval != ERROR_OK)
 				goto reset_pg_and_lock;
 
@@ -622,15 +619,14 @@ cleanup:
 static int stm32x_get_device_id(struct flash_bank *bank, uint32_t *device_id)
 {
 	struct target *target = bank->target;
-	struct cortex_m_common *cortex_m = target_to_cm(target);
 	uint32_t device_id_register = 0;
 
 	if (!target_was_examined(target)) {
 		LOG_ERROR("Target not examined yet");
-		return ERROR_FAIL;
+		return ERROR_TARGET_NOT_EXAMINED;
 	}
 
-	switch (cortex_m->core_info->partno) {
+	switch (cortex_m_get_partno_safe(target)) {
 	case CORTEX_M0_PARTNO: /* STM32F0x devices */
 		device_id_register = 0x40015800;
 		break;
@@ -639,6 +635,9 @@ static int stm32x_get_device_id(struct flash_bank *bank, uint32_t *device_id)
 		break;
 	case CORTEX_M4_PARTNO: /* STM32F3x devices */
 		device_id_register = 0xE0042000;
+		break;
+	case CORTEX_M23_PARTNO: /* GD32E23x devices */
+		device_id_register = 0x40015800;
 		break;
 	default:
 		LOG_ERROR("Cannot identify target as a stm32x");
@@ -656,15 +655,14 @@ static int stm32x_get_device_id(struct flash_bank *bank, uint32_t *device_id)
 static int stm32x_get_flash_size(struct flash_bank *bank, uint16_t *flash_size_in_kb)
 {
 	struct target *target = bank->target;
-	struct cortex_m_common *cortex_m = target_to_cm(target);
 	uint32_t flash_size_reg;
 
 	if (!target_was_examined(target)) {
 		LOG_ERROR("Target not examined yet");
-		return ERROR_FAIL;
+		return ERROR_TARGET_NOT_EXAMINED;
 	}
 
-	switch (cortex_m->core_info->partno) {
+	switch (cortex_m_get_partno_safe(target)) {
 	case CORTEX_M0_PARTNO: /* STM32F0x devices */
 		flash_size_reg = 0x1FFFF7CC;
 		break;
@@ -673,6 +671,9 @@ static int stm32x_get_flash_size(struct flash_bank *bank, uint16_t *flash_size_i
 		break;
 	case CORTEX_M4_PARTNO: /* STM32F3x devices */
 		flash_size_reg = 0x1FFFF7CC;
+		break;
+	case CORTEX_M23_PARTNO: /* GD32E23x devices */
+		flash_size_reg = 0x1FFFF7E0;
 		break;
 	default:
 		LOG_ERROR("Cannot identify target as a stm32x");
@@ -756,8 +757,8 @@ static int stm32x_probe(struct flash_bank *bank)
 		page_size = 1024;
 		stm32x_info->ppage_size = 4;
 		max_flash_size_in_kb = 128;
-		/* GigaDevice GD32F1x0 & GD32F3x0 series devices share DEV_ID
-		   with STM32F101/2/3 medium-density line,
+		/* GigaDevice GD32F1x0 & GD32F3x0 & GD32E23x series devices
+		   share DEV_ID with STM32F101/2/3 medium-density line,
 		   however they use a REV_ID different from any STM32 device.
 		   The main difference is another offset of user option bits
 		   (like WDG_SW, nRST_STOP, nRST_STDBY) in option byte register
@@ -773,6 +774,11 @@ static int stm32x_probe(struct flash_bank *bank)
 		case 0x1704: /* gd32f3x0 */
 			stm32x_info->user_data_offset = 16;
 			stm32x_info->option_offset = 6;
+			break;
+		case 0x1909: /* gd32e23x */
+			stm32x_info->user_data_offset = 16;
+			stm32x_info->option_offset = 6;
+			max_flash_size_in_kb = 64;
 			break;
 		}
 		break;
@@ -982,6 +988,10 @@ static int get_stm32x_info(struct flash_bank *bank, struct command_invocation *c
 
 		case 0x1704: /* gd32f3x0 */
 			device_str = "GD32F3x0";
+			break;
+
+		case 0x1909: /* gd32e23x */
+			device_str = "GD32E23x";
 			break;
 
 		case 0x2000:
@@ -1530,7 +1540,7 @@ COMMAND_HANDLER(stm32x_handle_mass_erase_command)
 	return retval;
 }
 
-static const struct command_registration stm32x_exec_command_handlers[] = {
+static const struct command_registration stm32f1x_exec_command_handlers[] = {
 	{
 		.name = "lock",
 		.handler = stm32x_handle_lock_command,
@@ -1578,20 +1588,20 @@ static const struct command_registration stm32x_exec_command_handlers[] = {
 	COMMAND_REGISTRATION_DONE
 };
 
-static const struct command_registration stm32x_command_handlers[] = {
+static const struct command_registration stm32f1x_command_handlers[] = {
 	{
 		.name = "stm32f1x",
 		.mode = COMMAND_ANY,
 		.help = "stm32f1x flash command group",
 		.usage = "",
-		.chain = stm32x_exec_command_handlers,
+		.chain = stm32f1x_exec_command_handlers,
 	},
 	COMMAND_REGISTRATION_DONE
 };
 
 const struct flash_driver stm32f1x_flash = {
 	.name = "stm32f1x",
-	.commands = stm32x_command_handlers,
+	.commands = stm32f1x_command_handlers,
 	.flash_bank_command = stm32x_flash_bank_command,
 	.erase = stm32x_erase,
 	.protect = stm32x_protect,

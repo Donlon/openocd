@@ -201,7 +201,9 @@ struct target {
 										 * and must be detected when symbols are offered */
 	struct backoff_timer backoff;
 	int smp;							/* add some target attributes for smp support */
-	struct target_list *head;
+	struct list_head *smp_targets;		/* list all targets in this smp group/cluster
+										 * The head of the list is shared between the
+										 * cluster, thus here there is a pointer */
 	/* the gdb service is there in case of smp, we have only one gdb server
 	 * for all smp target
 	 * the target attached to the gdb is changing dynamically by changing
@@ -220,8 +222,8 @@ struct target {
 };
 
 struct target_list {
+	struct list_head lh;
 	struct target *target;
-	struct target_list *next;
 };
 
 struct gdb_fileio_info {
@@ -294,6 +296,15 @@ enum target_event {
 	TARGET_EVENT_GDB_FLASH_WRITE_END,
 
 	TARGET_EVENT_TRACE_CONFIG,
+
+	TARGET_EVENT_SEMIHOSTING_USER_CMD_0x100 = 0x100, /* semihosting allows user cmds from 0x100 to 0x1ff */
+	TARGET_EVENT_SEMIHOSTING_USER_CMD_0x101 = 0x101,
+	TARGET_EVENT_SEMIHOSTING_USER_CMD_0x102 = 0x102,
+	TARGET_EVENT_SEMIHOSTING_USER_CMD_0x103 = 0x103,
+	TARGET_EVENT_SEMIHOSTING_USER_CMD_0x104 = 0x104,
+	TARGET_EVENT_SEMIHOSTING_USER_CMD_0x105 = 0x105,
+	TARGET_EVENT_SEMIHOSTING_USER_CMD_0x106 = 0x106,
+	TARGET_EVENT_SEMIHOSTING_USER_CMD_0x107 = 0x107,
 };
 
 struct target_event_action {
@@ -547,7 +558,7 @@ int target_step(struct target *target,
 int target_run_algorithm(struct target *target,
 		int num_mem_params, struct mem_param *mem_params,
 		int num_reg_params, struct reg_param *reg_param,
-		uint32_t entry_point, uint32_t exit_point,
+		target_addr_t entry_point, target_addr_t exit_point,
 		int timeout_ms, void *arch_info);
 
 /**
@@ -558,7 +569,7 @@ int target_run_algorithm(struct target *target,
 int target_start_algorithm(struct target *target,
 		int num_mem_params, struct mem_param *mem_params,
 		int num_reg_params, struct reg_param *reg_params,
-		uint32_t entry_point, uint32_t exit_point,
+		target_addr_t entry_point, target_addr_t exit_point,
 		void *arch_info);
 
 /**
@@ -569,7 +580,7 @@ int target_start_algorithm(struct target *target,
 int target_wait_algorithm(struct target *target,
 		int num_mem_params, struct mem_param *mem_params,
 		int num_reg_params, struct reg_param *reg_params,
-		uint32_t exit_point, int timeout_ms,
+		target_addr_t exit_point, int timeout_ms,
 		void *arch_info);
 
 /**
@@ -726,6 +737,13 @@ int target_alloc_working_area(struct target *target,
  */
 int target_alloc_working_area_try(struct target *target,
 		uint32_t size, struct working_area **area);
+/**
+ * Free a working area.
+ * Restore target data if area backup is configured.
+ * @param target
+ * @param area Pointer to the area to be freed or NULL
+ * @returns ERROR_OK if successful; error code if restore failed
+ */
 int target_free_working_area(struct target *target, struct working_area *area);
 void target_free_all_working_areas(struct target *target);
 uint32_t target_get_working_area_avail(struct target *target);
