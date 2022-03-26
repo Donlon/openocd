@@ -802,10 +802,10 @@ int flash_write_unlock_verify(struct target *target, struct image *image,
             free(buffer);
             buffer = NULL;
             if (retval != ERROR_OK) {
-                LOG_ERROR("Can't write %d bytes to 0x%08x, %d", run_size, run_address, retval);
+                LOG_ERROR("Can't write %d bytes to " TARGET_ADDR_FMT ", %d", run_size, run_address, retval);
                 return retval;
             }
-            LOG_INFO("Write %d bytes to 0x%08x", run_size, run_address);
+            LOG_INFO("Write %d bytes to " TARGET_ADDR_FMT, run_size, run_address);
             section++;
 			section_offset = 0;
 			continue;
